@@ -1943,6 +1943,10 @@ function damageReactionModule(bot, defaultMove) {
   let lastGoalRefresh = 0;
   let lastAttackAt = 0;
   let weaponEquipping = false;
+  let weaponStowing = false;
+  let combatWeaponEquippedByUs = false;
+  let combatWeaponName = null;
+  let creeperPhase = null;
   let lastNoWeaponLog = 0;
   let lastCreeperWarningAt = 0;
 
@@ -2028,24 +2032,47 @@ function damageReactionModule(bot, defaultMove) {
     return message;
   }
 
+  function isCombatWeaponName(name) {
+    const n = String(name || "").toLowerCase();
+    return /_(sword|axe)$/.test(n) || n === "trident" || n === "mace";
+  }
+
   function findWeapon() {
     const items = bot.inventory && bot.inventory.items ? bot.inventory.items() : [];
-    // Prefer swords over axes; never choose blocks or tools such as pickaxes.
-    return items.find((item) => /_sword$/.test(item.name)) ||
-      items.find((item) => /_axe$/.test(item.name)) || null;
+    // Rank known melee weapons by their normal base hit damage. Enchantments
+    // and special fall damage are not inferred from inventory metadata.
+    const damage = {
+      netherite_axe: 10, diamond_axe: 9, iron_axe: 9, stone_axe: 9,
+      golden_axe: 7, wooden_axe: 7,
+      trident: 9,
+      netherite_sword: 8, diamond_sword: 7, iron_sword: 6,
+      stone_sword: 5, golden_sword: 4, wooden_sword: 4,
+      mace: 6
+    };
+    return items
+      .filter((item) => isCombatWeaponName(item.name))
+      .sort((a, b) => (damage[String(b.name).toLowerCase()] || 0) - (damage[String(a.name).toLowerCase()] || 0))[0] || null;
   }
 
   async function equipBestWeapon() {
-    if (weaponEquipping) return false;
+    if (weaponEquipping || weaponStowing) return false;
     const weapon = findWeapon();
     if (!weapon) return false;
     const held = bot.heldItem;
-    if (held && held.name === weapon.name) return true;
+    if (held && held.name === weapon.name) {
+      combatWeaponName = held.name;
+      combatWeaponEquippedByUs = true;
+      return true;
+    }
     weaponEquipping = true;
     try {
       await bot.equip(weapon, "hand");
-      const equipped = !!(bot.heldItem && /_(sword|axe)$/.test(bot.heldItem.name));
-      if (equipped) addLog(`[Combat] Equipped ${bot.heldItem.name}.`);
+      const equipped = !!(bot.heldItem && bot.heldItem.name === weapon.name);
+      if (equipped) {
+        combatWeaponName = bot.heldItem.name;
+        combatWeaponEquippedByUs = true;
+        addLog(`[Combat] Equipped strongest available weapon: ${bot.heldItem.name}.`);
+      }
       return equipped;
     } catch (e) {
       addLog("[Combat] Could not equip weapon:", e.message);
@@ -2055,23 +2082,55 @@ function damageReactionModule(bot, defaultMove) {
     }
   }
 
+  async function stowCombatWeapon() {
+    if (weaponStowing || weaponEquipping) return false;
+    const held = bot.heldItem;
+    // When no attack is in progress, any melee weapon in the hand is put away,
+    // including one that was already selected before this module took over.
+    // Other items (food, blocks, tools) are left untouched.
+    if (!held || !isCombatWeaponName(held.name)) {
+      combatWeaponEquippedByUs = false;
+      combatWeaponName = null;
+      return false;
+    }
+    if (typeof bot.unequip !== "function") return false;
+    weaponStowing = true;
+    try {
+      await bot.unequip("hand");
+      combatWeaponEquippedByUs = false;
+      combatWeaponName = null;
+      addLog("[Combat] Weapon stowed; no attack in progress.");
+      return true;
+    } catch (e) {
+      addLog("[Combat] Could not stow weapon:", e.message);
+      return false;
+    } finally {
+      weaponStowing = false;
+    }
+  }
+
   function hasWeapon() {
     const held = bot.heldItem;
-    if (held && /_(sword|axe)$/.test(held.name)) return true;
+    if (held && isCombatWeaponName(held.name)) return true;
     return !!findWeapon();
   }
 
   function stopCombat(reason) {
-    if (currentMode === null && currentTargetId === null) return;
+    if (currentMode === null && currentTargetId === null) {
+      void stowCombatWeapon();
+      return;
+    }
     try { if (bot.pathfinder) bot.pathfinder.setGoal(null); } catch (e) {}
     addLog(`[Combat] Combat behaviour ended: ${reason}.`);
     currentTargetId = null;
     currentMode = null;
+    creeperPhase = null;
     lastGoalRefresh = 0;
     bot.__manjiCombatUntil = Date.now() + 700;
+    void stowCombatWeapon();
   }
 
-  function setFleeGoal(target) {
+  function setFleeGoal(target, retreatDistance = fleeDistance) {
     if (!target || !target.position || !bot.entity || !bot.pathfinder) return;
     let dx = bot.entity.position.x - target.position.x;
     let dz = bot.entity.position.z - target.position.z;
@@ -2088,8 +2147,8 @@ function damageReactionModule(bot, defaultMove) {
     const side = (Math.random() - 0.5) * 0.45;
     const nx = dx / length - (dz / length) * side;
     const nz = dz / length + (dx / length) * side;
-    const destX = Math.floor(bot.entity.position.x + nx * fleeDistance);
-    const destZ = Math.floor(bot.entity.position.z + nz * fleeDistance);
+    const destX = Math.floor(bot.entity.position.x + nx * retreatDistance);
+    const destZ = Math.floor(bot.entity.position.z + nz * retreatDistance);
     const destY = Math.floor(bot.entity.position.y);
     bot.pathfinder.setMovements(defaultMove);
     bot.pathfinder.setGoal(new GoalNear(destX, destY, destZ, 2));
@@ -2113,14 +2172,20 @@ function damageReactionModule(bot, defaultMove) {
         return;
       }
 
+      const now = Date.now();
       const mobKey = String(target.name || "").toLowerCase();
       const isCreeper = mobKey === "creeper";
+      const targetDistance = distanceTo(target);
       const weaponAvailable = hasWeapon();
-      const shouldFlee = isCreeper || !weaponAvailable;
-      const mode = shouldFlee ? "flee" : "attack";
-      const targetChanged = currentTargetId !== target.id || currentMode !== mode;
-      currentTargetId = target.id;
-      currentMode = mode;
+      const targetChanged = currentTargetId !== target.id;
+      const previousMode = currentMode;
+
+      if (targetChanged) {
+        currentTargetId = target.id;
+        lastGoalRefresh = 0;
+        creeperPhase = isCreeper ? (weaponAvailable ? "approach" : "retreat") : null;
+      }
+
       bot.__manjiCombatUntil = Date.now() + 1800;
 
       if (isCreeper && targetChanged && Date.now() - lastCreeperWarningAt > 6000) {
@@ -2128,30 +2193,120 @@ function damageReactionModule(bot, defaultMove) {
         lastCreeperWarningAt = Date.now();
       }
 
-      if (shouldFlee) {
-        const targetDistance = distanceTo(target);
-        if (isCreeper && targetDistance > safeDistance) {
-          stopCombat("creeper is far enough away");
+      // Creepers use a cautious hit-and-retreat cycle: close in, strike once,
+      // immediately create distance, then repeat only after reaching safety.
+      if (isCreeper) {
+        if (!weaponAvailable) {
+          currentMode = "flee";
+          creeperPhase = "retreat";
+          await stowCombatWeapon();
+          if (targetDistance >= safeDistance) {
+            stopCombat("unarmed creeper is far enough away");
+            return;
+          }
+          if (targetChanged || previousMode !== "flee" || Date.now() - lastGoalRefresh >= 1100) {
+            setFleeGoal(target, fleeDistance);
+          }
           return;
         }
-        if (!isCreeper && targetDistance > safeDistance) {
+
+        if (!creeperPhase) creeperPhase = "approach";
+
+        if (creeperPhase === "retreat") {
+          currentMode = "creeper-retreat";
+          await stowCombatWeapon();
+          if (targetDistance >= 8) {
+            try { bot.pathfinder.setGoal(null); } catch (e) {}
+            creeperPhase = "approach";
+            currentMode = "creeper-approach";
+            lastGoalRefresh = 0;
+            addLog("[Combat] Creeper at a safer distance; preparing another approach.");
+          } else {
+            if (targetChanged || previousMode !== "creeper-retreat" || Date.now() - lastGoalRefresh >= 1000) {
+              setFleeGoal(target, 10);
+            }
+            return;
+          }
+        }
+
+        currentMode = "creeper-approach";
+        if (targetDistance > 3.0) {
+          // Keep the weapon in inventory while closing the distance.
+          await stowCombatWeapon();
+          if (targetChanged || previousMode !== "creeper-approach" || Date.now() - lastGoalRefresh >= 1400) {
+            try {
+              bot.pathfinder.setMovements(defaultMove);
+              bot.pathfinder.setGoal(new GoalFollow(target, 2.5), true);
+              lastGoalRefresh = Date.now();
+              addLog(`[Combat] Approaching creeper cautiously (distance=${targetDistance.toFixed(1)}).`);
+            } catch (e) {
+              addLog("[Combat] Could not approach creeper:", e.message);
+              stopCombat("could not approach creeper");
+            }
+          }
+          return;
+        }
+
+        // Equip only at melee range, immediately before the strike.
+        const equipped = await equipBestWeapon();
+        if (!equipped) {
+          creeperPhase = "retreat";
+          currentMode = "creeper-retreat";
+          setFleeGoal(target, 10);
+          return;
+        }
+
+        let attacked = false;
+        try {
+          const aim = target.position.offset(0, Math.max(0.5, (target.height || 1.5) * 0.55), 0);
+          await bot.lookAt(aim, true);
+          if (bot.entities && bot.entities[target.id] && distanceTo(target) <= 3.15 &&
+              (typeof bot.canSeeEntity !== "function" || bot.canSeeEntity(target))) {
+            bot.attack(target);
+            lastAttackAt = Date.now();
+            attacked = true;
+            addLog("[Combat] Struck creeper; retreating immediately.");
+          }
+        } catch (e) {
+          addLog("[Combat] Creeper strike failed:", e.message);
+        }
+
+        // Even if line-of-sight prevented the hit, do not remain beside a
+        // creeper waiting for another chance while its fuse may be active.
+        creeperPhase = "retreat";
+        currentMode = "creeper-retreat";
+        setFleeGoal(target, 10);
+        await new Promise((resolve) => setTimeout(resolve, attacked ? 180 : 80));
+        await stowCombatWeapon();
+        return;
+      }
+
+      // Other hostile mobs: equip the strongest weapon while pursuing and
+      // fighting, but put it away as soon as no hostile target remains.
+      if (!weaponAvailable) {
+        currentMode = "flee";
+        await stowCombatWeapon();
+        if (targetDistance > safeDistance) {
           stopCombat("unarmed threat is far enough away");
           return;
         }
-        if (targetChanged || Date.now() - lastGoalRefresh >= 1100) setFleeGoal(target);
-        if (Date.now() - lastNoWeaponLog > 10000 && !isCreeper && !weaponAvailable) {
-          addLog("[Combat] No sword or axe found; Manji is retreating instead of fighting unarmed.");
+        if (targetChanged || previousMode !== "flee" || Date.now() - lastGoalRefresh >= 1100) {
+          setFleeGoal(target, fleeDistance);
+        }
+        if (Date.now() - lastNoWeaponLog > 10000) {
+          addLog("[Combat] No melee weapon found; Manji is retreating instead of fighting unarmed.");
           lastNoWeaponLog = Date.now();
         }
         return;
       }
 
-      if (targetChanged) {
+      currentMode = "attack";
+      if (targetChanged || previousMode !== "attack") {
         try {
           bot.pathfinder.setMovements(defaultMove);
           bot.pathfinder.setGoal(new GoalFollow(target, 2), true);
           lastGoalRefresh = Date.now();
-          addLog(`[Combat] Detected ${mobNames[mobKey] || mobKey} (entity type=${target.type || "unknown"}, distance=${distanceTo(target).toFixed(1)}); approaching.`);
+          addLog(`[Combat] Detected ${mobNames[mobKey] || mobKey} (entity type=${target.type || "unknown"}, distance=${targetDistance.toFixed(1)}); approaching.`);
         } catch (e) {
           addLog("[Combat] Could not start pursuit:", e.message);
           stopCombat("could not pathfind to target");
@@ -2159,14 +2314,10 @@ function damageReactionModule(bot, defaultMove) {
         }
       }
 
-      // Re-equip after target changes or if another action altered the hand.
-      if (!bot.heldItem || !/_(sword|axe)$/.test(bot.heldItem.name)) {
-        await equipBestWeapon();
-      }
-
-      const distance = distanceTo(target);
+      const equipped = await equipBestWeapon();
+      if (!equipped) return;
       if (
-        distance <= 3.35 &&
+        targetDistance <= 3.35 &&
         Date.now() - lastAttackAt >= 650 &&
         bot.entities && bot.entities[target.id]
       ) {
