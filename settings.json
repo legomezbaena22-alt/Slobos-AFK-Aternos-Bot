@@ -117,9 +117,9 @@
       ]
     },
     "self-defence": {
-      "enabled": false,
+      "enabled": true,
       "combat-radius": 8,
-      "max-combat-ms": 30000,
+      "max-combat-ms": 15000,
       "player-retaliation-hits": 2,
       "flee-distance": 10
     }

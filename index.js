@@ -3,7 +3,7 @@
 const { addLog, getLogs } = require("./logger");
 const mineflayer = require("@wp2508/mineflayer");
 const { Movements, pathfinder, goals } = require("mineflayer-pathfinder");
-const { GoalBlock, GoalNear } = goals;
+const { GoalBlock, GoalNear, GoalFollow } = goals;
 const config = require("./settings.json");
 const express = require("express");
 const http = require("http");
@@ -1665,6 +1665,8 @@ function startCircleWalk(bot, defaultMove) {
 
   addInterval(() => {
     if (!bot || !botState.connected) return;
+    // Let the temporary combat goal control navigation; resume circle-walk afterwards.
+    if (bot.__manjiCombatUntil > Date.now()) return;
     const now = Date.now();
     if (now - lastPathTime < 2000) return;
     lastPathTime = now;
@@ -2016,47 +2018,69 @@ function damageReactionModule(bot, defaultMove) {
 
   async function defendAgainst(target) {
     if (!combatEnabled || combatBusy || !target || !botState.connected) return;
+    // Counterattack hostile mobs only. Players still trigger chat reactions but
+    // Manji will not hit players or start PvP.
+    if (target.type !== "mob") return;
+    const mobKey = String(target.name || "").toLowerCase();
+    if (!hostileMobs.has(mobKey)) return;
+
     combatBusy = true;
     currentTargetId = target.id;
-    bot.__manjiCombatUntil = Date.now() + combatDuration;
+    const deadline = Date.now() + combatDuration;
+    bot.__manjiCombatUntil = deadline;
     try {
-      const isPlayer = target.type === "player";
-      const mobKey = String(target.name || "").toLowerCase();
-      const attackerName = String(target.username || target.name || "jugador");
-      const mobLabel = mobNames[mobKey] || mobKey.replace(/_/g, " ") || "mob";
-
-      if (isPlayer) {
-        // Player retaliation is deliberately limited to one or two aimed hits,
-        // then Manji creates distance instead of entering a prolonged PvP fight.
-        for (let hit = 0; hit < playerRetaliationHits; hit++) {
-          if (!botState.connected || !bot.entities[target.id] || distanceTo(target) > combatRadius) break;
-          await faceAndAttack(target);
-          await new Promise((resolve) => setTimeout(resolve, 650));
-        }
+      // Creepers are too dangerous to chase into melee range.
+      if (mobKey === "creeper") {
         await fleeFrom(target);
-      } else {
-        // Hostile mobs: defend for a bounded period; creepers are treated as
-        // high-risk and Manji backs away instead of approaching to melee range.
-        if (mobKey === "creeper") {
-          await fleeFrom(target);
-        } else {
-          await equipBestWeapon();
-          const deadline = Date.now() + combatDuration;
-          while (
-            botState.connected &&
-            Date.now() < deadline &&
-            bot.entities[target.id] &&
-            distanceTo(target) <= combatRadius
-          ) {
-            await faceAndAttack(target);
-            await new Promise((resolve) => setTimeout(resolve, 700));
+        return;
+      }
+
+      await equipBestWeapon();
+      if (!bot.pathfinder || typeof GoalFollow !== "function") {
+        addLog("[Combat] GoalFollow unavailable; counterattack skipped safely.");
+        return;
+      }
+
+      bot.pathfinder.setMovements(defaultMove);
+      bot.pathfinder.setGoal(new GoalFollow(target, 2), true);
+      addLog(`[Combat] Counterattacking ${mobNames[mobKey] || mobKey}.`);
+
+      let lastAttack = 0;
+      while (
+        botState.connected &&
+        Date.now() < deadline &&
+        bot.entities && bot.entities[target.id] &&
+        target.position &&
+        distanceTo(target) <= combatRadius
+      ) {
+        const distance = distanceTo(target);
+        if (distance <= 3.4 && Date.now() - lastAttack >= 650) {
+          try {
+            const aim = target.position.offset(0, Math.max(0.5, (target.height || 1.5) * 0.55), 0);
+            await bot.lookAt(aim, true);
+            if (bot.entities[target.id] && distanceTo(target) <= 3.6) {
+              bot.attack(target);
+              lastAttack = Date.now();
+            }
+          } catch (e) {
+            addLog("[Combat] Attack attempt failed:", e.message);
           }
         }
+        await new Promise((resolve) => setTimeout(resolve, 150));
       }
+    } catch (e) {
+      addLog("[Combat] Counterattack error:", e.message);
     } finally {
+      try {
+        if (bot.pathfinder && typeof bot.pathfinder.setGoal === "function") {
+          bot.pathfinder.setGoal(null);
+        }
+      } catch (e) {}
       currentTargetId = null;
-      bot.__manjiCombatUntil = Date.now() + 3000;
+      // Give the normal circle-walk loop time to set its next goal.
+      bot.__manjiCombatUntil = Date.now() + 2500;
       combatBusy = false;
+      addLog("[Combat] Counterattack finished; normal movement will resume.");
     }
   }
 
