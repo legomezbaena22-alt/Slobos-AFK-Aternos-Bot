@@ -1471,141 +1471,20 @@ function initializeModules(bot, mcData, defaultMove) {
     }
   }
 
-  // ---------- MOVE TO RANDOM SAFE POSITION IN CONFIGURED AREA ----------
-  // The configured X/Z are the center. Pick a safe ground-level block within
-  // the horizontal radius; there is intentionally NO leash/return-to-area loop.
-  function moveToConfiguredArea(reason = "initial spawn") {
-    if (!bot || !botState.connected || !config.position || !config.position.enabled) return;
-    if (
-      config.movement &&
-      config.movement["circle-walk"] &&
-      config.movement["circle-walk"].enabled
-    ) return;
-
-    const centerX = Number(config.position.x);
-    const centerY = Number(config.position.y);
-    const centerZ = Number(config.position.z);
-    const radius = Math.max(0, Number(config.position.radius) || 0);
-    const candidates = [];
-
-    // Random points inside a circular X/Z radius, not a square.
-    for (let attempt = 0; attempt < 40; attempt++) {
-      const angle = Math.random() * Math.PI * 2;
-      const distance = Math.sqrt(Math.random()) * radius;
-      const x = Math.floor(centerX + Math.cos(angle) * distance);
-      const z = Math.floor(centerZ + Math.sin(angle) * distance);
-
-      // Search nearby Y levels for a solid floor and two clear blocks above it.
-      for (let dy = 5; dy >= -8; dy--) {
-        const y = Math.floor(centerY + dy);
-        const offset = bot.entity.position.offset(
-          x - Math.floor(bot.entity.position.x),
-          y - Math.floor(bot.entity.position.y),
-          z - Math.floor(bot.entity.position.z)
-        );
-        const floor = bot.blockAt(offset.offset(0, -1, 0));
-        const feet = bot.blockAt(offset);
-        const head = bot.blockAt(offset.offset(0, 1, 0));
-        const isLiquid = (block) =>
-          block && /water|lava/.test(String(block.name || "").toLowerCase());
-        if (
-          floor && floor.boundingBox === "block" && !isLiquid(floor) &&
-          feet && feet.boundingBox === "empty" && !isLiquid(feet) &&
-          head && head.boundingBox === "empty" && !isLiquid(head)
-        ) {
-          candidates.push({ x, y, z });
-          break;
-        }
-      }
-    }
-
-    if (!candidates.length) {
-      addLog("[Position] No safe ground position found inside configured radius.");
-      return;
-    }
-
-    const target = candidates[Math.floor(Math.random() * candidates.length)];
-    bot.pathfinder.setMovements(defaultMove);
-    bot.pathfinder.setGoal(new GoalBlock(target.x, target.y, target.z));
-    addLog(`[Position] Moving to safe point (${target.x}, ${target.y}, ${target.z}) within radius ${radius} (${reason}).`);
-  }
-
-  if (config.position && config.position.enabled) {
-    moveToConfiguredArea("spawn");
-    // Re-select a point in the same area after death/respawn.
-    bot.on("death", () => {
-      bot.once("spawn", () => {
-        setTimeout(() => moveToConfiguredArea("respawn"), 1500);
-      });
-    });
-
-  }
-
+  // The procedural movement controller below owns all normal positioning.
+  // It uses config.position as a fixed centre rather than deriving new points
+  // from Manji's current position (which caused the old circle walk to drift).
 
   // ---------- ANTI-AFK ----------
+  // Normal movement now provides the AFK activity. Do not randomly change the
+  // hotbar: that used to replace a sword with unrelated blocks during combat.
   if (config.utils["anti-afk"] && config.utils["anti-afk"].enabled) {
-    // Arm swinging
-    addInterval(
-      () => {
-        if (!bot || !botState.connected) return;
-        try {
-          bot.swingArm();
-        } catch (e) {}
-      },
-      10000 + Math.floor(Math.random() * 50000),
-    );
-
-    // Hotbar cycling
-    addInterval(
-      () => {
-        if (!bot || !botState.connected) return;
-        try {
-          const slot = Math.floor(Math.random() * 9);
-          bot.setQuickBarSlot(slot);
-        } catch (e) {}
-      },
-      30000 + Math.floor(Math.random() * 90000),
-    );
-
-    // Teabagging
-    addInterval(
-      () => {
-        if (
-          !bot ||
-          !botState.connected ||
-          typeof bot.setControlState !== "function"
-        )
-          return;
-        if (Math.random() > 0.9) {
-          let count = 2 + Math.floor(Math.random() * 4);
-          const doTeabag = () => {
-            if (count <= 0 || !bot || typeof bot.setControlState !== "function")
-              return;
-            try {
-              bot.setControlState("sneak", true);
-              setTimeout(() => {
-                if (bot && typeof bot.setControlState === "function")
-                  bot.setControlState("sneak", false);
-                count--;
-                setTimeout(doTeabag, 150);
-              }, 150);
-            } catch (e) {}
-          };
-          doTeabag();
-        }
-      },
-      120000 + Math.floor(Math.random() * 180000),
-    );
-
-    // Random blind micro-walking is intentionally disabled: it can lead Manji
-    // into rivers or over edges. Navigation uses pathfinder with swimming off.
-
-    if (config.utils["anti-afk"].sneak) {
-      try {
-        if (typeof bot.setControlState === "function")
-          bot.setControlState("sneak", true);
-      } catch (e) {}
-    }
+    try {
+      if (typeof bot.setControlState === "function") {
+        bot.setControlState("sneak", false);
+        bot.setControlState("jump", false);
+      }
+    } catch (e) {}
   }
 
   // ---------- MOVEMENT MODULES ----------
@@ -1617,7 +1496,7 @@ function initializeModules(bot, mcData, defaultMove) {
       config.movement["circle-walk"] &&
       config.movement["circle-walk"].enabled
     ) {
-      startCircleWalk(bot, defaultMove);
+      startProceduralMovement(bot, defaultMove);
     }
     // FIX: only run random-jump if circle-walk is NOT running (circle-walk also keeps bot moving)
     if (
@@ -1658,35 +1537,191 @@ function initializeModules(bot, mcData, defaultMove) {
 // ============================================================
 // MOVEMENT HELPERS
 // ============================================================
-function startCircleWalk(bot, defaultMove) {
-  const radius = config.movement["circle-walk"].radius;
-  let angle = 0;
-  let lastPathTime = 0;
+function startProceduralMovement(bot, defaultMove) {
+  const pos = config.position || {};
+  const configured = pos.enabled !== false &&
+    Number.isFinite(Number(pos.x)) && Number.isFinite(Number(pos.z));
+  const centerX = configured ? Number(pos.x) : bot.entity.position.x;
+  const centerY = configured && Number.isFinite(Number(pos.y)) ? Number(pos.y) : bot.entity.position.y;
+  const centerZ = configured ? Number(pos.z) : bot.entity.position.z;
+  const radius = configured ? Math.max(1, Number(pos.radius) || 5) : 8;
+  // Keep waypoint block-centres slightly inside the configured radius.
+  const usableRadius = Math.max(0.5, radius - 0.55);
+  let currentGoal = null;
+  let nextActionAt = Date.now() + 1200;
+  let goalStartedAt = 0;
+  let lastProgressAt = Date.now();
+  let lastPosition = bot.entity.position.clone();
+  let safePointsCache = [];
+  let safePointsCachedAt = 0;
+
+  function horizontalDistanceToCenter(position) {
+    return Math.hypot(position.x - centerX, position.z - centerZ);
+  }
+
+  function isLiquid(block) {
+    return !!block && /water|lava/.test(String(block.name || "").toLowerCase());
+  }
+
+  function findSafePoints() {
+    const now = Date.now();
+    if (safePointsCache.length && now - safePointsCachedAt < 12000) return safePointsCache;
+    const points = [];
+    const minX = Math.floor(centerX - usableRadius - 0.5);
+    const maxX = Math.ceil(centerX + usableRadius - 0.5);
+    const minZ = Math.floor(centerZ - usableRadius - 0.5);
+    const maxZ = Math.ceil(centerZ + usableRadius - 0.5);
+
+    for (let x = minX; x <= maxX; x++) {
+      for (let z = minZ; z <= maxZ; z++) {
+        const blockCenterX = x + 0.5;
+        const blockCenterZ = z + 0.5;
+        if (Math.hypot(blockCenterX - centerX, blockCenterZ - centerZ) > usableRadius) continue;
+
+        // Check a narrow vertical band around the configured Y to avoid choosing
+        // a floor on top of a nearby building or a distant floor level.
+        const verticalOffsets = [0, -1, 1, -2, 2, -3, 3, -4, 4, -5];
+        for (const dy of verticalOffsets) {
+          const y = Math.floor(centerY + dy);
+          const feetPos = bot.entity.position.offset(
+            blockCenterX - bot.entity.position.x,
+            y - bot.entity.position.y,
+            blockCenterZ - bot.entity.position.z
+          );
+          const floor = bot.blockAt(feetPos.offset(0, -1, 0));
+          const feet = bot.blockAt(feetPos);
+          const head = bot.blockAt(feetPos.offset(0, 1, 0));
+          if (
+            floor && floor.boundingBox === "block" && !isLiquid(floor) &&
+            feet && feet.boundingBox === "empty" && !isLiquid(feet) &&
+            head && head.boundingBox === "empty" && !isLiquid(head)
+          ) {
+            points.push({ x, y, z, centerX: blockCenterX, centerZ: blockCenterZ });
+            break;
+          }
+        }
+      }
+    }
+
+    safePointsCache = points;
+    safePointsCachedAt = now;
+    return points;
+  }
+
+  function chooseWaypoint(points) {
+    if (!points.length) return null;
+    const current = bot.entity.position;
+    const outside = horizontalDistanceToCenter(current) > usableRadius;
+    const candidates = points.filter((point) =>
+      Math.hypot(point.centerX - current.x, point.centerZ - current.z) > 1.35
+    );
+    const pool = candidates.length ? candidates : points;
+    if (outside) {
+      // When outside the assigned area, prioritise the closest safe point back in.
+      const nearest = [...pool].sort((a, b) =>
+        Math.hypot(a.centerX - current.x, a.centerZ - current.z) -
+        Math.hypot(b.centerX - current.x, b.centerZ - current.z)
+      )[0];
+      return nearest ? { ...nearest, returning: true } : null;
+    }
+    // A random nearby waypoint produces a less repetitive, non-circular route.
+    const weighted = pool.filter((point) => {
+      const d = Math.hypot(point.centerX - current.x, point.centerZ - current.z);
+      return d >= 1.35 && d <= Math.min(usableRadius * 1.8, 7.5);
+    });
+    const choices = weighted.length ? weighted : pool;
+    const selected = choices[Math.floor(Math.random() * choices.length)];
+    return selected ? { ...selected, returning: false } : null;
+  }
+
+  addLog(`[Movement] Procedural roaming enabled. Fixed centre=(${centerX.toFixed(2)}, ${centerY.toFixed(2)}, ${centerZ.toFixed(2)}), radius=${radius}.`);
 
   addInterval(() => {
-    if (!bot || !botState.connected) return;
-    // Let the temporary combat goal control navigation; resume circle-walk afterwards.
-    if (bot.__manjiCombatUntil > Date.now()) return;
+    if (!bot || !botState.connected || !bot.entity || !bot.pathfinder) return;
+    if (bot.__manjiCombatUntil && bot.__manjiCombatUntil > Date.now()) return;
+
     const now = Date.now();
-    if (now - lastPathTime < 2000) return;
-    lastPathTime = now;
-    try {
-      const x = bot.entity.position.x + Math.cos(angle) * radius;
-      const z = bot.entity.position.z + Math.sin(angle) * radius;
-      bot.pathfinder.setMovements(defaultMove);
-      bot.pathfinder.setGoal(
-        new GoalBlock(
-          Math.floor(x),
-          Math.floor(bot.entity.position.y),
-          Math.floor(z),
-        ),
-      );
-      angle += Math.PI / 4;
-      botState.lastActivity = Date.now();
-    } catch (e) {
-      addLog("[CircleWalk] Error:", e.message);
+    const position = bot.entity.position;
+    const moved = position.distanceTo(lastPosition);
+    if (moved > 0.25) {
+      lastPosition = position.clone();
+      lastProgressAt = now;
     }
-  }, config.movement["circle-walk"].speed);
+
+    if (currentGoal) {
+      // If a normal roaming path tries to drift beyond the assigned radius,
+      // stop it and choose a waypoint back inside. Recovery paths from an
+      // already-outside spawn are allowed to return to the area.
+      if (!currentGoal.returning && horizontalDistanceToCenter(position) > radius + 0.05) {
+        bot.pathfinder.setGoal(null);
+        currentGoal = null;
+        nextActionAt = now + 250;
+        addLog("[Movement] Area boundary reached; cancelling outward path.");
+        return;
+      }
+      const goalDistance = Math.hypot(
+        position.x - (currentGoal.x + 0.5),
+        position.z - (currentGoal.z + 0.5)
+      );
+      if (goalDistance <= 1.25) {
+        bot.pathfinder.setGoal(null);
+        currentGoal = null;
+        // Short natural pauses between destinations.
+        nextActionAt = now + 1400 + Math.floor(Math.random() * 4200);
+        if (Math.random() < 0.35) {
+          const yaw = Math.random() * Math.PI * 2 - Math.PI;
+          const pitch = (Math.random() - 0.5) * 0.35;
+          bot.look(yaw, pitch, false).catch(() => {});
+        }
+        return;
+      }
+
+      // If a destination is blocked or unreachable, abandon it instead of
+      // spinning around the same structure forever.
+      if (now - lastProgressAt > 7000 || now - goalStartedAt > 25000) {
+        bot.pathfinder.setGoal(null);
+        currentGoal = null;
+        nextActionAt = now + 1000 + Math.floor(Math.random() * 1500);
+        lastProgressAt = now;
+        addLog("[Movement] Waypoint stalled; selecting a different safe point.");
+      }
+      return;
+    }
+
+    if (now < nextActionAt) return;
+
+    // Sometimes pause briefly and look around rather than walking continuously.
+    if (Math.random() < 0.22) {
+      const yaw = Math.random() * Math.PI * 2 - Math.PI;
+      const pitch = (Math.random() - 0.5) * 0.45;
+      bot.look(yaw, pitch, false).catch(() => {});
+      nextActionAt = now + 1800 + Math.floor(Math.random() * 4500);
+      return;
+    }
+
+    const points = findSafePoints();
+    const target = chooseWaypoint(points);
+    if (!target) {
+      nextActionAt = now + 5000;
+      addLog("[Movement] No safe waypoint found inside the configured area; will retry.");
+      return;
+    }
+
+    try {
+      bot.pathfinder.setMovements(defaultMove);
+      bot.pathfinder.setGoal(new GoalBlock(target.x, target.y, target.z));
+      currentGoal = target;
+      goalStartedAt = now;
+      lastProgressAt = now;
+      lastPosition = position.clone();
+      botState.lastActivity = now;
+      addLog(`[Movement] New natural waypoint (${target.x}, ${target.y}, ${target.z}).`);
+    } catch (e) {
+      currentGoal = null;
+      nextActionAt = now + 2500;
+      addLog("[Movement] Could not set waypoint:", e.message);
+    }
+  }, 750);
 }
 
 function startRandomJump(bot) {
@@ -1883,40 +1918,47 @@ function bedModule(bot, mcData) {
 // Mineflayer's entityHurt event identifies the victim, not always the exact
 // source. We only act when there is one plausible nearby attacker.
 function damageReactionModule(bot, defaultMove) {
-  const settings = config.interactions && config.interactions["damage-reactions"];
-  if (!settings || !settings.enabled) return;
+  const root = config.interactions || {};
+  const settings = root["damage-reactions"] || {};
+  const combat = root["self-defence"] || {};
+  const reactionsEnabled = settings.enabled !== false;
+  const combatEnabled = combat.enabled === true;
+  if (!reactionsEnabled && !combatEnabled) return;
 
   const baseCooldown = Math.max(1000, Number(settings["base-cooldown-ms"]) || 5000);
   const rapidCooldown = Math.max(1000, Number(settings["rapid-cooldown-ms"]) || 1800);
   const rapidWindow = Math.max(1000, Number(settings["rapid-window-ms"]) || 10000);
   const attackerRadius = Math.max(2, Number(settings["attacker-radius"]) || 12);
-  const combat = config.interactions["self-defence"] || {};
-  const combatEnabled = combat.enabled !== false;
-  const combatRadius = Math.max(3, Number(combat["combat-radius"]) || 16);
-  const combatDuration = Math.max(5000, Number(combat["max-combat-ms"]) || 30000);
-  const playerRetaliationHits = Math.max(1, Math.min(2, Number(combat["player-retaliation-hits"]) || 2));
-  const fleeDistance = Math.max(5, Number(combat["flee-distance"]) || 14);
+  const detectionRadius = Math.max(4, Number(combat["detection-radius"]) || 12);
+  const combatRadius = Math.max(detectionRadius, Number(combat["combat-radius"]) || 16);
+  const safeDistance = Math.max(8, Number(combat["safe-distance"]) || 14);
+  const fleeDistance = Math.max(8, Number(combat["flee-distance"]) || 16);
 
   let lastReactionAt = 0;
   let lastDamageAt = 0;
   let previousMessage = null;
-  let combatBusy = false;
+  let controllerBusy = false;
   let currentTargetId = null;
+  let currentMode = null;
+  let lastGoalRefresh = 0;
+  let lastAttackAt = 0;
+  let weaponEquipping = false;
+  let lastNoWeaponLog = 0;
+  let lastCreeperWarningAt = 0;
 
   const hostileMobs = new Set([
     "blaze", "bogged", "breeze", "cave_spider", "creeper", "drowned",
     "elder_guardian", "ender_dragon", "endermite", "evoker", "ghast",
     "guardian", "hoglin", "husk", "illusioner", "magma_cube", "phantom",
     "piglin_brute", "pillager", "ravager", "shulker", "silverfish",
-    "skeleton", "slime", "spider", "stray", "vex", "vindicator",
-    "warden", "witch", "wither", "wither_skeleton", "zoglin",
-    "zombie", "zombie_villager", "zombified_piglin"
+    "skeleton", "slime", "spider", "stray", "vex", "vindicator", "warden",
+    "witch", "wither", "wither_skeleton", "zoglin", "zombie",
+    "zombie_villager", "zombified_piglin"
   ]);
-
   const mobNames = {
     blaze: "blaze", bogged: "bogged", breeze: "breeze", cave_spider: "araña de cueva",
     creeper: "creeper", drowned: "ahogado", elder_guardian: "guardián anciano",
-    ender_dragon: "dragón del End", endermite: "endermite", evoker: "evocador",
+    ender_dragon: "Ender Dragon", endermite: "endermite", evoker: "invocador",
     ghast: "ghast", guardian: "guardián", hoglin: "hoglin", husk: "zombi momificado",
     illusioner: "ilusionista", magma_cube: "cubo de magma", phantom: "phantom",
     piglin_brute: "piglin bruto", pillager: "saqueador", ravager: "devastador",
@@ -1926,7 +1968,6 @@ function damageReactionModule(bot, defaultMove) {
     wither_skeleton: "esqueleto del Wither", zoglin: "zoglin", zombie: "zombi",
     zombie_villager: "aldeano zombi", zombified_piglin: "piglin zombificado"
   };
-
   const playerMessages = Array.isArray(settings["player-messages"]) && settings["player-messages"].length
     ? settings["player-messages"]
     : ["¡Eh, {name}! ¿Qué haces?", "¡Deja de pegarme, {name}!", "¡Oye, que estoy aquí!"];
@@ -1935,23 +1976,31 @@ function damageReactionModule(bot, defaultMove) {
     : ["¡Un {mob} me está atacando!", "¡Cuidado, un {mob}!", "¡Que alguien me ayude con ese {mob}!"];
   const generalMessages = Array.isArray(settings["general-messages"]) && settings["general-messages"].length
     ? settings["general-messages"]
-    : ["¡Ouch!", "¡Ay! ¡Eso ha dolido!", "¡Eh, que duele!", "¡Pero bueno! ¿A qué ha venido eso?", "¡Que alguien me eche una mano!", "¡No me dejan ni tranquilo!", "¡Auch! ¡Menudo golpe!"];
+    : ["¡Ouch!", "¡Ay! ¡Eso ha dolido!", "¡Eh, que duele!"];
 
   function distanceTo(entity) {
-    return entity.position.distanceTo(bot.entity.position);
+    return entity && entity.position && bot.entity
+      ? entity.position.distanceTo(bot.entity.position)
+      : Infinity;
+  }
+
+  function getHostiles(maxDistance = Infinity) {
+    if (!bot.entity || !bot.entities) return [];
+    return Object.values(bot.entities).filter((entity) => {
+      if (!entity || entity.id === bot.entity.id || entity.type !== "mob" || !entity.position) return false;
+      const key = String(entity.name || "").toLowerCase();
+      return hostileMobs.has(key) && distanceTo(entity) <= maxDistance;
+    }).sort((a, b) => distanceTo(a) - distanceTo(b));
   }
 
   function findLikelyAttacker() {
     if (!bot.entity || !bot.entities) return null;
     const candidates = Object.values(bot.entities).filter((candidate) => {
       if (!candidate || candidate.id === bot.entity.id || !candidate.position) return false;
-      const distance = distanceTo(candidate);
-      if (!Number.isFinite(distance) || distance > attackerRadius) return false;
+      if (distanceTo(candidate) > attackerRadius) return false;
       if (candidate.type === "player") return true;
-      return hostileMobs.has(String(candidate.name || "").toLowerCase());
+      return candidate.type === "mob" && hostileMobs.has(String(candidate.name || "").toLowerCase());
     });
-    // Prefer the nearest plausible attacker. This is more tolerant in a busy
-    // town where unrelated entities may also be nearby.
     candidates.sort((a, b) => distanceTo(a) - distanceTo(b));
     return candidates[0] || null;
   }
@@ -1959,9 +2008,7 @@ function damageReactionModule(bot, defaultMove) {
   function randomMessage(pool, replacements = {}) {
     let choices = pool.map((template) => {
       let message = String(template);
-      for (const [key, value] of Object.entries(replacements)) {
-        message = message.split(`{${key}}`).join(String(value));
-      }
+      for (const [key, value] of Object.entries(replacements)) message = message.split(`{${key}}`).join(String(value));
       return message.replace(/\{(?:name|mob)\}/g, "").replace(/\s{2,}/g, " ").trim();
     }).filter(Boolean);
     if (!choices.length) choices = generalMessages;
@@ -1974,168 +2021,203 @@ function damageReactionModule(bot, defaultMove) {
     return message;
   }
 
-  async function equipBestWeapon() {
+  function findWeapon() {
     const items = bot.inventory && bot.inventory.items ? bot.inventory.items() : [];
-    const weapon = items.find((item) => /_sword$/.test(item.name)) ||
-      items.find((item) => /_axe$/.test(item.name));
-    if (weapon) {
-      try { await bot.equip(weapon, "hand"); } catch (e) {}
-    }
+    // Prefer swords over axes; never choose blocks or tools such as pickaxes.
+    return items.find((item) => /_sword$/.test(item.name)) ||
+      items.find((item) => /_axe$/.test(item.name)) || null;
   }
 
-  async function faceAndAttack(target) {
-    if (!target || !target.position || !bot.entity) return false;
+  async function equipBestWeapon() {
+    if (weaponEquipping) return false;
+    const weapon = findWeapon();
+    if (!weapon) return false;
+    const held = bot.heldItem;
+    if (held && held.name === weapon.name) return true;
+    weaponEquipping = true;
     try {
-      const aim = target.position.offset(0, Math.max(0.5, (target.height || 1.5) * 0.55), 0);
-      await bot.lookAt(aim, true);
-      if (typeof bot.canSeeEntity === "function" && !bot.canSeeEntity(target)) return false;
-      await equipBestWeapon();
-      if (!bot.entity || !bot.entities || !bot.entities[target.id]) return false;
-      bot.attack(target);
-      return true;
+      await bot.equip(weapon, "hand");
+      return !!(bot.heldItem && /_(sword|axe)$/.test(bot.heldItem.name));
     } catch (e) {
-      addLog("[Combat] Attack failed:", e.message);
+      addLog("[Combat] Could not equip weapon:", e.message);
       return false;
-    }
-  }
-
-  async function fleeFrom(target) {
-    if (!target || !target.position || !bot.entity || !bot.pathfinder) return false;
-    const dx = bot.entity.position.x - target.position.x;
-    const dz = bot.entity.position.z - target.position.z;
-    const length = Math.sqrt(dx * dx + dz * dz) || 1;
-    const destX = Math.floor(bot.entity.position.x + (dx / length) * fleeDistance);
-    const destZ = Math.floor(bot.entity.position.z + (dz / length) * fleeDistance);
-    const destY = Math.floor(bot.entity.position.y);
-    try {
-      bot.pathfinder.setMovements(defaultMove);
-      bot.pathfinder.setGoal(new GoalNear(destX, destY, destZ, 2));
-      addLog(`[Combat] Manji is fleeing from ${target.name || "a hostile mob"} (no weapon or creeper).`);
-      return true;
-    } catch (e) {
-      addLog("[Combat] Could not start fleeing:", e.message);
-      return false;
+    } finally {
+      weaponEquipping = false;
     }
   }
 
   function hasWeapon() {
-    const items = bot.inventory && bot.inventory.items ? bot.inventory.items() : [];
-    return items.some((item) => /_(sword|axe)$/.test(item.name));
+    const held = bot.heldItem;
+    if (held && /_(sword|axe)$/.test(held.name)) return true;
+    return !!findWeapon();
   }
 
-  async function defendAgainst(target) {
-    if (!combatEnabled || combatBusy || !target || !botState.connected) return;
-    // Counterattack hostile mobs only. Players still trigger chat reactions but
-    // Manji will not hit players or start PvP.
-    if (target.type !== "mob") return;
-    const mobKey = String(target.name || "").toLowerCase();
-    if (!hostileMobs.has(mobKey)) return;
+  function stopCombat(reason) {
+    if (currentMode === null && currentTargetId === null) return;
+    try { if (bot.pathfinder) bot.pathfinder.setGoal(null); } catch (e) {}
+    addLog(`[Combat] Combat behaviour ended: ${reason}.`);
+    currentTargetId = null;
+    currentMode = null;
+    lastGoalRefresh = 0;
+    bot.__manjiCombatUntil = Date.now() + 700;
+  }
 
-    combatBusy = true;
-    currentTargetId = target.id;
-    const deadline = Date.now() + combatDuration;
-    bot.__manjiCombatUntil = deadline;
-    let keepRetreatGoal = false;
+  function setFleeGoal(target) {
+    if (!target || !target.position || !bot.entity || !bot.pathfinder) return;
+    let dx = bot.entity.position.x - target.position.x;
+    let dz = bot.entity.position.z - target.position.z;
+    let length = Math.hypot(dx, dz);
+    if (length < 0.25) {
+      // If the mob is directly on top of Manji, pick a direction instead of
+      // generating a zero-length escape vector.
+      const angle = Math.random() * Math.PI * 2;
+      dx = Math.cos(angle);
+      dz = Math.sin(angle);
+      length = 1;
+    }
+    // A small sideways component avoids getting stuck against the same wall.
+    const side = (Math.random() - 0.5) * 0.45;
+    const nx = dx / length - (dz / length) * side;
+    const nz = dz / length + (dx / length) * side;
+    const destX = Math.floor(bot.entity.position.x + nx * fleeDistance);
+    const destZ = Math.floor(bot.entity.position.z + nz * fleeDistance);
+    const destY = Math.floor(bot.entity.position.y);
+    bot.pathfinder.setMovements(defaultMove);
+    bot.pathfinder.setGoal(new GoalNear(destX, destY, destZ, 2));
+    lastGoalRefresh = Date.now();
+    addLog(`[Combat] Fleeing from ${target.name || "hostile mob"}.`);
+  }
+
+  async function controllerTick() {
+    if (controllerBusy || !combatEnabled || !botState.connected || !bot.entity || !bot.pathfinder) return;
+    controllerBusy = true;
     try {
-      // Creepers are too dangerous to chase into melee range.
-      // If Manji has no sword or axe, retreat instead of fighting bare-handed.
-      if (mobKey === "creeper" || !hasWeapon()) {
-        const fleeing = await fleeFrom(target);
-        if (fleeing) {
-          // Keep the retreat goal active; do not let finally cancel it immediately.
-          keepRetreatGoal = true;
-          await new Promise((resolve) => setTimeout(resolve, 5000));
+      const nearby = getHostiles(detectionRadius);
+      const active = currentTargetId && bot.entities ? bot.entities[currentTargetId] : null;
+      let target = nearby.find((entity) => entity.name === "creeper") || nearby[0] || null;
+
+      // Continue the existing target briefly even if it has moved just beyond
+      // the scan radius, so a fight/retreat is not cancelled between scans.
+      if (!target && active && active.position && distanceTo(active) <= combatRadius) target = active;
+      if (!target) {
+        stopCombat("no hostile mobs nearby");
+        return;
+      }
+
+      const mobKey = String(target.name || "").toLowerCase();
+      const isCreeper = mobKey === "creeper";
+      const weaponAvailable = hasWeapon();
+      const shouldFlee = isCreeper || !weaponAvailable;
+      const mode = shouldFlee ? "flee" : "attack";
+      const targetChanged = currentTargetId !== target.id || currentMode !== mode;
+      currentTargetId = target.id;
+      currentMode = mode;
+      bot.__manjiCombatUntil = Date.now() + 1800;
+
+      if (isCreeper && targetChanged && Date.now() - lastCreeperWarningAt > 6000) {
+        try { bot.chat("¡Ayuda! ¡Un creeper me está persiguiendo!"); } catch (e) {}
+        lastCreeperWarningAt = Date.now();
+      }
+
+      if (shouldFlee) {
+        const targetDistance = distanceTo(target);
+        if (isCreeper && targetDistance > safeDistance) {
+          stopCombat("creeper is far enough away");
+          return;
+        }
+        if (!isCreeper && targetDistance > safeDistance) {
+          stopCombat("unarmed threat is far enough away");
+          return;
+        }
+        if (targetChanged || Date.now() - lastGoalRefresh >= 1100) setFleeGoal(target);
+        if (Date.now() - lastNoWeaponLog > 10000 && !isCreeper && !weaponAvailable) {
+          addLog("[Combat] No sword or axe found; Manji is retreating instead of fighting unarmed.");
+          lastNoWeaponLog = Date.now();
         }
         return;
       }
 
-      await equipBestWeapon();
-      if (!bot.pathfinder || typeof GoalFollow !== "function") {
-        addLog("[Combat] GoalFollow unavailable; counterattack skipped safely.");
-        return;
+      if (targetChanged) {
+        try {
+          bot.pathfinder.setMovements(defaultMove);
+          bot.pathfinder.setGoal(new GoalFollow(target, 2), true);
+          lastGoalRefresh = Date.now();
+          addLog(`[Combat] Approaching hostile mob: ${mobNames[mobKey] || mobKey}.`);
+        } catch (e) {
+          addLog("[Combat] Could not start pursuit:", e.message);
+          stopCombat("could not pathfind to target");
+          return;
+        }
       }
 
-      bot.pathfinder.setMovements(defaultMove);
-      bot.pathfinder.setGoal(new GoalFollow(target, 2), true);
-      addLog(`[Combat] Counterattacking ${mobNames[mobKey] || mobKey}.`);
+      // Re-equip after target changes or if another action altered the hand.
+      if (!bot.heldItem || !/_(sword|axe)$/.test(bot.heldItem.name)) {
+        await equipBestWeapon();
+      }
 
-      let lastAttack = 0;
-      while (
-        botState.connected &&
-        Date.now() < deadline &&
-        bot.entities && bot.entities[target.id] &&
-        target.position &&
-        distanceTo(target) <= combatRadius
+      const distance = distanceTo(target);
+      if (
+        distance <= 3.35 &&
+        Date.now() - lastAttackAt >= 650 &&
+        bot.entities && bot.entities[target.id]
       ) {
-        const distance = distanceTo(target);
-        if (distance <= 3.4 && Date.now() - lastAttack >= 650) {
-          try {
-            const aim = target.position.offset(0, Math.max(0.5, (target.height || 1.5) * 0.55), 0);
-            await bot.lookAt(aim, true);
+        try {
+          const aim = target.position.offset(0, Math.max(0.5, (target.height || 1.5) * 0.55), 0);
+          await bot.lookAt(aim, true);
+          if (typeof bot.canSeeEntity !== "function" || bot.canSeeEntity(target)) {
             if (bot.entities[target.id] && distanceTo(target) <= 3.6) {
               bot.attack(target);
-              lastAttack = Date.now();
+              lastAttackAt = Date.now();
             }
-          } catch (e) {
-            addLog("[Combat] Attack attempt failed:", e.message);
           }
+        } catch (e) {
+          addLog("[Combat] Attack attempt failed:", e.message);
         }
-        await new Promise((resolve) => setTimeout(resolve, 150));
       }
     } catch (e) {
-      addLog("[Combat] Counterattack error:", e.message);
+      addLog("[Combat] Controller error:", e.message);
     } finally {
-      try {
-        if (!keepRetreatGoal && bot.pathfinder && typeof bot.pathfinder.setGoal === "function") {
-          bot.pathfinder.setGoal(null);
-        }
-      } catch (e) {}
-      currentTargetId = null;
-      // Give the normal circle-walk loop time to set its next goal.
-      bot.__manjiCombatUntil = Date.now() + 2500;
-      combatBusy = false;
-      addLog("[Combat] Counterattack finished; normal movement will resume.");
+      controllerBusy = false;
     }
   }
 
-  bot.on("entityHurt", (entity) => {
-    if (!bot || !botState.connected || !bot.entity || !entity || entity.id !== bot.entity.id) return;
-    const attacker = findLikelyAttacker();
-    if (!attacker) return;
+  if (combatEnabled) {
+    // Scan continuously, not only after receiving damage. This is the key fix
+    // for mobs standing nearby while Manji continues his idle route.
+    addInterval(() => controllerTick(), 450);
+    addLog(`[Combat] Continuous hostile scan enabled (radius ${detectionRadius}).`);
+  }
 
-    const now = Date.now();
-    const repeatedHits = now - lastDamageAt <= rapidWindow;
-    lastDamageAt = now;
-    const cooldown = repeatedHits ? rapidCooldown : baseCooldown;
+  if (reactionsEnabled) {
+    bot.on("entityHurt", (entity) => {
+      if (!bot || !botState.connected || !bot.entity || !entity || entity.id !== bot.entity.id) return;
+      const attacker = findLikelyAttacker();
+      if (!attacker) return;
 
-    const isPlayer = attacker.type === "player";
-    const attackerName = String(attacker.username || (isPlayer && attacker.name && attacker.name !== "player" ? attacker.name : ""));
-    const mobKey = String(attacker.name || "").toLowerCase();
-    const mobLabel = mobNames[mobKey] || mobKey.replace(/_/g, " ") || "mob";
+      const now = Date.now();
+      const repeatedHits = now - lastDamageAt <= rapidWindow;
+      lastDamageAt = now;
+      const cooldown = repeatedHits ? rapidCooldown : baseCooldown;
+      const isPlayer = attacker.type === "player";
+      const attackerName = String(attacker.username || (isPlayer && attacker.name && attacker.name !== "player" ? attacker.name : ""));
+      const mobKey = String(attacker.name || "").toLowerCase();
+      const mobLabel = mobNames[mobKey] || mobKey.replace(/_/g, " ") || "mob";
 
-    if (now - lastReactionAt >= cooldown) {
-      // Mix universal reactions with contextual ones. Universal phrases work
-      // regardless of whether the source is a player or a hostile mob.
-      const contextualPool = isPlayer
-        ? playerMessages.filter((message) => !String(message).includes("{name}") || Boolean(attackerName))
-        : mobMessages.filter((message) => !String(message).includes("{mob}") || Boolean(mobNames[mobKey]));
-      const message = randomMessage(
-        [...generalMessages, ...contextualPool],
-        { name: attackerName, mob: mobLabel }
-      );
-      lastReactionAt = now;
-      try {
-        bot.chat(message);
-        addLog(`[Interaction] ${isPlayer ? "Player" : "Mob"} damage reaction: ${message}`);
-      } catch (e) {
-        addLog("[Interaction] Could not send damage reaction:", e.message);
+      if (now - lastReactionAt >= cooldown) {
+        const contextualPool = isPlayer
+          ? playerMessages.filter((message) => !String(message).includes("{name}") || Boolean(attackerName))
+          : mobMessages.filter((message) => !String(message).includes("{mob}") || Boolean(mobNames[mobKey]));
+        const message = randomMessage([...generalMessages, ...contextualPool], { name: attackerName, mob: mobLabel });
+        lastReactionAt = now;
+        try {
+          bot.chat(message);
+          addLog(`[Interaction] ${isPlayer ? "Player" : "Mob"} damage reaction: ${message}`);
+        } catch (e) {
+          addLog("[Interaction] Could not send damage reaction:", e.message);
+        }
       }
-    }
-
-    if (combatEnabled && currentTargetId !== attacker.id) {
-      defendAgainst(attacker).catch((e) => addLog("[Combat] Defence error:", e.message));
-    }
-  });
+    });
+  }
 }
 
 // Chat module

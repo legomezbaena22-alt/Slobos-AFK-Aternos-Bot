@@ -25,7 +25,7 @@
     },
     "anti-afk": {
       "enabled": true,
-      "sneak": true
+      "sneak": false
     },
     "chat-messages": {
       "enabled": true,
@@ -49,26 +49,26 @@
     "circle-walk": {
       "enabled": true,
       "radius": 4,
-      "speed": 3000
+      "speed": 750
     },
     "look-around": {
       "enabled": true,
-      "interval": 5000
+      "interval": 8000
     },
     "random-jump": {
-      "enabled": true,
+      "enabled": false,
       "interval": 10000
     }
   },
   "modules": {
-    "avoidMobs": true,
+    "avoidMobs": false,
     "combat": true,
     "beds": false,
     "chat": true,
     "console-commands": true
   },
   "combat": {
-    "attack-mobs": true,
+    "attack-mobs": false,
     "auto-eat": true
   },
   "beds": {
@@ -119,9 +119,11 @@
     "self-defence": {
       "enabled": true,
       "combat-radius": 16,
-      "max-combat-ms": 15000,
+      "max-combat-ms": 30000,
       "player-retaliation-hits": 2,
-      "flee-distance": 14
+      "flee-distance": 16,
+      "detection-radius": 12,
+      "safe-distance": 14
     }
   }
 }
