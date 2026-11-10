@@ -104,7 +104,16 @@
         "¡Un {mob} me está atacando!",
         "¡Cuidado, un {mob}!",
         "¡Que alguien me ayude con ese {mob}!",
-        "¡Aparta, {mob}!"
+        "¡Me están atacando!"
+      ],
+      "general-messages": [
+        "¡Ouch!",
+        "¡Ay! ¡Eso ha dolido!",
+        "¡Eh, que duele!",
+        "¡Pero bueno! ¿A qué ha venido eso?",
+        "¡Que alguien me eche una mano!",
+        "¡No me dejan ni tranquilo!",
+        "¡Auch! ¡Menudo golpe!"
       ]
     },
     "self-defence": {

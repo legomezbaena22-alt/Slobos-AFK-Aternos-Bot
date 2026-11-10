@@ -1927,10 +1927,13 @@ function damageReactionModule(bot, defaultMove) {
 
   const playerMessages = Array.isArray(settings["player-messages"]) && settings["player-messages"].length
     ? settings["player-messages"]
-    : ["¡Eh, {name}! ¿Qué haces?", "¡Deja de pegarme!", "¡Oye, que estoy aquí!"];
+    : ["¡Eh, {name}! ¿Qué haces?", "¡Deja de pegarme, {name}!", "¡Oye, que estoy aquí!"];
   const mobMessages = Array.isArray(settings["mob-messages"]) && settings["mob-messages"].length
     ? settings["mob-messages"]
     : ["¡Un {mob} me está atacando!", "¡Cuidado, un {mob}!", "¡Que alguien me ayude con ese {mob}!"];
+  const generalMessages = Array.isArray(settings["general-messages"]) && settings["general-messages"].length
+    ? settings["general-messages"]
+    : ["¡Ouch!", "¡Ay! ¡Eso ha dolido!", "¡Eh, que duele!", "¡Pero bueno! ¿A qué ha venido eso?", "¡Que alguien me eche una mano!", "¡No me dejan ni tranquilo!", "¡Auch! ¡Menudo golpe!"];
 
   function distanceTo(entity) {
     return entity.position.distanceTo(bot.entity.position);
@@ -1951,11 +1954,15 @@ function damageReactionModule(bot, defaultMove) {
     return candidates[0] || null;
   }
 
-  function randomMessage(pool, replacements) {
-    let choices = pool.map((template) => Object.entries(replacements).reduce(
-      (message, [key, value]) => message.replace(new RegExp("\\\\{" + key + "\\\\}", "g"), value),
-      String(template)
-    ));
+  function randomMessage(pool, replacements = {}) {
+    let choices = pool.map((template) => {
+      let message = String(template);
+      for (const [key, value] of Object.entries(replacements)) {
+        message = message.split(`{${key}}`).join(String(value));
+      }
+      return message.replace(/\{(?:name|mob)\}/g, "").replace(/\s{2,}/g, " ").trim();
+    }).filter(Boolean);
+    if (!choices.length) choices = generalMessages;
     if (choices.length > 1 && previousMessage !== null) {
       const filtered = choices.filter((message) => message !== previousMessage);
       if (filtered.length) choices = filtered;
@@ -2064,13 +2071,18 @@ function damageReactionModule(bot, defaultMove) {
     const cooldown = repeatedHits ? rapidCooldown : baseCooldown;
 
     const isPlayer = attacker.type === "player";
-    const attackerName = String(attacker.username || attacker.name || "jugador");
+    const attackerName = String(attacker.username || (isPlayer && attacker.name && attacker.name !== "player" ? attacker.name : ""));
     const mobKey = String(attacker.name || "").toLowerCase();
     const mobLabel = mobNames[mobKey] || mobKey.replace(/_/g, " ") || "mob";
 
     if (now - lastReactionAt >= cooldown) {
+      // Mix universal reactions with contextual ones. Universal phrases work
+      // regardless of whether the source is a player or a hostile mob.
+      const contextualPool = isPlayer
+        ? playerMessages.filter((message) => !String(message).includes("{name}") || Boolean(attackerName))
+        : mobMessages.filter((message) => !String(message).includes("{mob}") || Boolean(mobNames[mobKey]));
       const message = randomMessage(
-        isPlayer ? playerMessages : mobMessages,
+        [...generalMessages, ...contextualPool],
         { name: attackerName, mob: mobLabel }
       );
       lastReactionAt = now;
