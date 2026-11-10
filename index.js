@@ -1271,6 +1271,11 @@ function createBot() {
       const defaultMove = new Movements(bot, mcData);
       defaultMove.allowFreeMotion = false;
       defaultMove.canDig = false;
+      // Keep movement grounded and natural: stairs/normal steps remain usable,
+      // but Manji will not pillar up 1x1 towers or make parkour leaps.
+      defaultMove.allow1by1towers = false;
+      defaultMove.allowParkour = false;
+      defaultMove.maxDropDown = 3;
       // Avoid autonomous swimming; riding in a boat remains possible.
       defaultMove.canSwim = false;
       defaultMove.liquidCost = 1000;
@@ -1541,100 +1546,173 @@ function startProceduralMovement(bot, defaultMove) {
   const pos = config.position || {};
   const configured = pos.enabled !== false &&
     Number.isFinite(Number(pos.x)) && Number.isFinite(Number(pos.z));
+  // The configured position is the spawn anchor, not a tiny walking pen.
   const centerX = configured ? Number(pos.x) : bot.entity.position.x;
   const centerY = configured && Number.isFinite(Number(pos.y)) ? Number(pos.y) : bot.entity.position.y;
   const centerZ = configured ? Number(pos.z) : bot.entity.position.z;
-  const radius = configured ? Math.max(1, Number(pos.radius) || 5) : 8;
-  // Keep waypoint block-centres slightly inside the configured radius.
-  const usableRadius = Math.max(0.5, radius - 0.55);
+  const explorationRadius = configured ? Math.max(20, Number(pos.radius) || 60) : 60;
+  const returnRadius = explorationRadius * 0.82;
+  const emergencyRadius = explorationRadius * 1.3;
+
   let currentGoal = null;
   let nextActionAt = Date.now() + 1200;
   let goalStartedAt = 0;
   let lastProgressAt = Date.now();
   let lastPosition = bot.entity.position.clone();
-  let safePointsCache = [];
-  let safePointsCachedAt = 0;
+  let lastGoalDistance = Infinity;
+  let heading = Math.random() * Math.PI * 2;
+  let turnBias = Math.random() < 0.5 ? -1 : 1;
+  const blockedWaypoints = new Map();
 
-  function horizontalDistanceToCenter(position) {
+  function distanceFromAnchor(position) {
     return Math.hypot(position.x - centerX, position.z - centerZ);
   }
 
   function isLiquid(block) {
-    return !!block && /water|lava/.test(String(block.name || "").toLowerCase());
+    return !!block && /water|lava/.test(String(block.name || '').toLowerCase());
   }
 
-  function findSafePoints() {
-    const now = Date.now();
-    if (safePointsCache.length && now - safePointsCachedAt < 12000) return safePointsCache;
-    const points = [];
-    const minX = Math.floor(centerX - usableRadius - 0.5);
-    const maxX = Math.ceil(centerX + usableRadius - 0.5);
-    const minZ = Math.floor(centerZ - usableRadius - 0.5);
-    const maxZ = Math.ceil(centerZ + usableRadius - 0.5);
+  function waypointKey(point) {
+    return `${point.x},${point.y},${point.z}`;
+  }
 
-    for (let x = minX; x <= maxX; x++) {
-      for (let z = minZ; z <= maxZ; z++) {
-        const blockCenterX = x + 0.5;
-        const blockCenterZ = z + 0.5;
-        if (Math.hypot(blockCenterX - centerX, blockCenterZ - centerZ) > usableRadius) continue;
+  function rememberBlocked(point, reason) {
+    if (!point) return;
+    blockedWaypoints.set(waypointKey(point), Date.now() + 45000);
+    for (const [key, expiry] of blockedWaypoints) {
+      if (expiry <= Date.now()) blockedWaypoints.delete(key);
+    }
+    addLog(`[Movement] Waypoint abandoned (${reason}); choosing another route.`);
+  }
 
-        // Check a narrow vertical band around the configured Y to avoid choosing
-        // a floor on top of a nearby building or a distant floor level.
-        const verticalOffsets = [0, -1, 1, -2, 2, -3, 3, -4, 4, -5];
-        for (const dy of verticalOffsets) {
-          const y = Math.floor(centerY + dy);
-          const feetPos = bot.entity.position.offset(
-            blockCenterX - bot.entity.position.x,
-            y - bot.entity.position.y,
-            blockCenterZ - bot.entity.position.z
-          );
-          const floor = bot.blockAt(feetPos.offset(0, -1, 0));
-          const feet = bot.blockAt(feetPos);
-          const head = bot.blockAt(feetPos.offset(0, 1, 0));
-          if (
-            floor && floor.boundingBox === "block" && !isLiquid(floor) &&
-            feet && feet.boundingBox === "empty" && !isLiquid(feet) &&
-            head && head.boundingBox === "empty" && !isLiquid(head)
-          ) {
-            points.push({ x, y, z, centerX: blockCenterX, centerZ: blockCenterZ });
-            break;
-          }
+  // Find a real, two-block-high standing space close to the intended location.
+  // A small local search is cheaper than scanning the entire 60-block area.
+  function findSafePointNear(idealX, idealZ, preferredY) {
+    if (!bot.entity || typeof bot.blockAt !== 'function') return null;
+    const current = bot.entity.position;
+    const baseX = Math.floor(idealX);
+    const baseZ = Math.floor(idealZ);
+    const offsets = [
+      [0, 0], [1, 0], [0, 1], [-1, 0], [0, -1],
+      [1, 1], [-1, 1], [1, -1], [-1, -1],
+      [2, 0], [0, 2], [-2, 0], [0, -2]
+    ];
+    const verticalOffsets = [0, -1, 1, -2, 2, -3, 3];
+    const candidates = [];
+
+    for (const [ox, oz] of offsets) {
+      const x = baseX + ox;
+      const z = baseZ + oz;
+      for (const dy of verticalOffsets) {
+        const y = Math.floor(preferredY) + dy;
+        const feetPos = current.offset(x + 0.5 - current.x, y - current.y, z + 0.5 - current.z);
+        const floor = bot.blockAt(feetPos.offset(0, -1, 0));
+        const feet = bot.blockAt(feetPos);
+        const head = bot.blockAt(feetPos.offset(0, 1, 0));
+        if (
+          floor && floor.boundingBox === 'block' && !isLiquid(floor) &&
+          feet && feet.boundingBox === 'empty' && !isLiquid(feet) &&
+          head && head.boundingBox === 'empty' && !isLiquid(head)
+        ) {
+          const candidate = { x, y, z };
+          const blockedUntil = blockedWaypoints.get(waypointKey(candidate)) || 0;
+          if (blockedUntil > Date.now()) continue;
+          const score = Math.hypot((x + 0.5) - idealX, (z + 0.5) - idealZ) + Math.abs(y - preferredY) * 1.8;
+          candidates.push({ ...candidate, score });
         }
       }
     }
-
-    safePointsCache = points;
-    safePointsCachedAt = now;
-    return points;
+    candidates.sort((a, b) => a.score - b.score);
+    return candidates[0] || null;
   }
 
-  function chooseWaypoint(points) {
-    if (!points.length) return null;
+  function chooseWaypoint() {
+    if (!bot.entity) return null;
     const current = bot.entity.position;
-    const outside = horizontalDistanceToCenter(current) > usableRadius;
-    const candidates = points.filter((point) =>
-      Math.hypot(point.centerX - current.x, point.centerZ - current.z) > 1.35
-    );
-    const pool = candidates.length ? candidates : points;
-    if (outside) {
-      // When outside the assigned area, prioritise the closest safe point back in.
-      const nearest = [...pool].sort((a, b) =>
-        Math.hypot(a.centerX - current.x, a.centerZ - current.z) -
-        Math.hypot(b.centerX - current.x, b.centerZ - current.z)
-      )[0];
-      return nearest ? { ...nearest, returning: true } : null;
+    const radialDistance = distanceFromAnchor(current);
+
+    // Beyond the soft boundary, head back toward a broad outer ring (about 82%
+    // of the radius), never all the way to spawn. Far outside, recover to it
+    // more decisively without changing the anchor.
+    if (radialDistance > explorationRadius) {
+      const radialAngle = Math.atan2(current.z - centerZ, current.x - centerX);
+      const desiredRadius = radialDistance > emergencyRadius
+        ? explorationRadius * 0.9
+        : returnRadius + Math.random() * explorationRadius * 0.045;
+      const desiredAngle = radialAngle + (Math.random() - 0.5) * 0.35;
+      const idealX = centerX + Math.cos(desiredAngle) * desiredRadius;
+      const idealZ = centerZ + Math.sin(desiredAngle) * desiredRadius;
+      return findSafePointNear(idealX, idealZ, current.y);
     }
-    // A random nearby waypoint produces a less repetitive, non-circular route.
-    const weighted = pool.filter((point) => {
-      const d = Math.hypot(point.centerX - current.x, point.centerZ - current.z);
-      return d >= 1.35 && d <= Math.min(usableRadius * 1.8, 7.5);
-    });
-    const choices = weighted.length ? weighted : pool;
-    const selected = choices[Math.floor(Math.random() * choices.length)];
-    return selected ? { ...selected, returning: false } : null;
+
+    // Correlated random walk: retain some heading from the previous leg, then
+    // add a bounded turn. Near the perimeter, follow a loose tangent or drift
+    // inward so Manji explores the area instead of orbiting a 5-block circle.
+    const nearBoundary = radialDistance > explorationRadius * 0.78;
+    const attempts = 22;
+    for (let attempt = 0; attempt < attempts; attempt++) {
+      let angle;
+      if (nearBoundary) {
+        const radialAngle = Math.atan2(current.z - centerZ, current.x - centerX);
+        if (Math.random() < 0.68) {
+          angle = radialAngle + turnBias * (Math.PI / 2 + (Math.random() - 0.5) * 0.9);
+        } else {
+          angle = radialAngle + Math.PI + (Math.random() - 0.5) * 0.9;
+        }
+        // Occasionally reverse the preferred tangent direction to avoid a fixed orbit.
+        if (Math.random() < 0.16) turnBias *= -1;
+      } else {
+        heading += (Math.random() - 0.5) * 1.35;
+        angle = heading;
+      }
+
+      const stepLength = 5 + Math.random() * 8;
+      const idealX = current.x + Math.cos(angle) * stepLength;
+      const idealZ = current.z + Math.sin(angle) * stepLength;
+      const safe = findSafePointNear(idealX, idealZ, current.y);
+      if (!safe) continue;
+      const resultingRadius = Math.hypot((safe.x + 0.5) - centerX, (safe.z + 0.5) - centerZ);
+      if (resultingRadius > explorationRadius * 1.035) continue;
+      if (Math.hypot((safe.x + 0.5) - current.x, (safe.z + 0.5) - current.z) < 3.2) continue;
+      heading = angle;
+      return safe;
+    }
+
+    // Last resort near the edge: choose a safe point on the outer ring.
+    const radialAngle = Math.atan2(current.z - centerZ, current.x - centerX);
+    const fallbackRadius = Math.min(returnRadius, Math.max(8, radialDistance - 5));
+    return findSafePointNear(
+      centerX + Math.cos(radialAngle) * fallbackRadius,
+      centerZ + Math.sin(radialAngle) * fallbackRadius,
+      current.y
+    );
   }
 
-  addLog(`[Movement] Procedural roaming enabled. Fixed centre=(${centerX.toFixed(2)}, ${centerY.toFixed(2)}, ${centerZ.toFixed(2)}), radius=${radius}.`);
+  function abandonCurrentGoal(reason) {
+    if (!currentGoal) return;
+    rememberBlocked(currentGoal, reason);
+    try { bot.pathfinder.setGoal(null); } catch (e) {}
+    currentGoal = null;
+    nextActionAt = Date.now() + 350 + Math.floor(Math.random() * 500);
+    lastProgressAt = Date.now();
+    lastGoalDistance = Infinity;
+  }
+
+  // Pathfinder exposes these events for no-path and stuck cases. They let us
+  // discard the blocked waypoint instead of repeatedly walking into the same block.
+  bot.on('path_update', (result) => {
+    if (!currentGoal || (bot.__manjiCombatUntil && bot.__manjiCombatUntil > Date.now())) return;
+    if (result && (result.status === 'noPath' || result.status === 'timeout')) {
+      abandonCurrentGoal(result.status);
+    }
+  });
+  bot.on('path_reset', (reason) => {
+    if (reason === 'stuck' && currentGoal && !(bot.__manjiCombatUntil && bot.__manjiCombatUntil > Date.now())) {
+      abandonCurrentGoal('pathfinder stuck');
+    }
+  });
+
+  addLog(`[Movement] Natural exploration enabled. Spawn anchor=(${centerX.toFixed(2)}, ${centerY.toFixed(2)}, ${centerZ.toFixed(2)}), soft radius=${explorationRadius}, return ring≈${returnRadius.toFixed(0)}.`);
 
   addInterval(() => {
     if (!bot || !botState.connected || !bot.entity || !bot.pathfinder) return;
@@ -1642,88 +1720,73 @@ function startProceduralMovement(bot, defaultMove) {
 
     const now = Date.now();
     const position = bot.entity.position;
-    const moved = position.distanceTo(lastPosition);
-    if (moved > 0.25) {
-      lastPosition = position.clone();
-      lastProgressAt = now;
-    }
 
     if (currentGoal) {
-      // If a normal roaming path tries to drift beyond the assigned radius,
-      // stop it and choose a waypoint back inside. Recovery paths from an
-      // already-outside spawn are allowed to return to the area.
-      if (!currentGoal.returning && horizontalDistanceToCenter(position) > radius + 0.05) {
-        bot.pathfinder.setGoal(null);
-        currentGoal = null;
-        nextActionAt = now + 250;
-        addLog("[Movement] Area boundary reached; cancelling outward path.");
-        return;
-      }
       const goalDistance = Math.hypot(
         position.x - (currentGoal.x + 0.5),
         position.z - (currentGoal.z + 0.5)
       );
-      if (goalDistance <= 1.25) {
-        bot.pathfinder.setGoal(null);
+      if (goalDistance <= 1.45) {
+        try { bot.pathfinder.setGoal(null); } catch (e) {}
         currentGoal = null;
-        // Short natural pauses between destinations.
-        nextActionAt = now + 1400 + Math.floor(Math.random() * 4200);
-        if (Math.random() < 0.35) {
+        nextActionAt = now + 1600 + Math.floor(Math.random() * 4300);
+        lastGoalDistance = Infinity;
+        if (Math.random() < 0.42) {
           const yaw = Math.random() * Math.PI * 2 - Math.PI;
-          const pitch = (Math.random() - 0.5) * 0.35;
+          const pitch = (Math.random() - 0.5) * 0.28;
           bot.look(yaw, pitch, false).catch(() => {});
         }
         return;
       }
 
-      // If a destination is blocked or unreachable, abandon it instead of
-      // spinning around the same structure forever.
-      if (now - lastProgressAt > 7000 || now - goalStartedAt > 25000) {
-        bot.pathfinder.setGoal(null);
-        currentGoal = null;
-        nextActionAt = now + 1000 + Math.floor(Math.random() * 1500);
+      // Measure progress toward the waypoint, not just any movement (turning or
+      // jittering in place must not count as progress).
+      if (goalDistance < lastGoalDistance - 0.25) {
+        lastGoalDistance = goalDistance;
         lastProgressAt = now;
-        addLog("[Movement] Waypoint stalled; selecting a different safe point.");
+        lastPosition = position.clone();
+      }
+      if (now - lastProgressAt > 4800 || now - goalStartedAt > 30000) {
+        abandonCurrentGoal('no forward progress');
       }
       return;
     }
 
     if (now < nextActionAt) return;
 
-    // Sometimes pause briefly and look around rather than walking continuously.
-    if (Math.random() < 0.22) {
+    // Natural pauses: look around, then select a new locally reachable leg.
+    if (Math.random() < 0.2) {
       const yaw = Math.random() * Math.PI * 2 - Math.PI;
-      const pitch = (Math.random() - 0.5) * 0.45;
+      const pitch = (Math.random() - 0.5) * 0.38;
       bot.look(yaw, pitch, false).catch(() => {});
-      nextActionAt = now + 1800 + Math.floor(Math.random() * 4500);
+      nextActionAt = now + 1800 + Math.floor(Math.random() * 4200);
       return;
     }
 
-    const points = findSafePoints();
-    const target = chooseWaypoint(points);
+    const target = chooseWaypoint();
     if (!target) {
-      nextActionAt = now + 5000;
-      addLog("[Movement] No safe waypoint found inside the configured area; will retry.");
+      nextActionAt = now + 1800;
+      addLog('[Movement] No safe nearby waypoint found; will try another direction.');
       return;
     }
 
     try {
       bot.pathfinder.setMovements(defaultMove);
-      bot.pathfinder.setGoal(new GoalBlock(target.x, target.y, target.z));
+      bot.pathfinder.setGoal(new GoalNear(target.x, target.y, target.z, 1));
       currentGoal = target;
       goalStartedAt = now;
       lastProgressAt = now;
+      lastGoalDistance = Math.hypot(position.x - (target.x + 0.5), position.z - (target.z + 0.5));
       lastPosition = position.clone();
       botState.lastActivity = now;
-      addLog(`[Movement] New natural waypoint (${target.x}, ${target.y}, ${target.z}).`);
+      addLog(`[Movement] Exploring toward waypoint (${target.x}, ${target.y}, ${target.z}); distance from spawn=${distanceFromAnchor(position).toFixed(1)}.`);
     } catch (e) {
       currentGoal = null;
-      nextActionAt = now + 2500;
-      addLog("[Movement] Could not set waypoint:", e.message);
+      nextActionAt = now + 1800;
+      addLog('[Movement] Could not set waypoint:', e.message);
     }
-  }, 750);
+  }, 650);
 }
-
 function startRandomJump(bot) {
   addInterval(() => {
     if (
@@ -1949,6 +2012,8 @@ function damageReactionModule(bot, defaultMove) {
   let creeperPhase = null;
   let lastNoWeaponLog = 0;
   let lastCreeperWarningAt = 0;
+  let fleePlan = null;
+  let fleeRouteIndex = 0;
 
   const hostileMobs = new Set([
     "blaze", "bogged", "breeze", "cave_spider", "creeper", "drowned",
@@ -2125,36 +2190,130 @@ function damageReactionModule(bot, defaultMove) {
     currentTargetId = null;
     currentMode = null;
     creeperPhase = null;
+    fleePlan = null;
     lastGoalRefresh = 0;
     bot.__manjiCombatUntil = Date.now() + 700;
     void stowCombatWeapon();
   }
 
+  function findEscapeStandingSpot(idealX, idealZ, preferredY) {
+    if (!bot.entity || typeof bot.blockAt !== 'function') return null;
+    const current = bot.entity.position;
+    const baseX = Math.floor(idealX);
+    const baseZ = Math.floor(idealZ);
+    const offsets = [
+      [0, 0], [1, 0], [0, 1], [-1, 0], [0, -1],
+      [1, 1], [-1, 1], [1, -1], [-1, -1],
+      [2, 0], [0, 2], [-2, 0], [0, -2]
+    ];
+    const candidates = [];
+    for (const [ox, oz] of offsets) {
+      const x = baseX + ox;
+      const z = baseZ + oz;
+      for (const dy of [0, -1, 1, -2, 2, -3]) {
+        const y = Math.floor(preferredY) + dy;
+        const feetPos = current.offset(x + 0.5 - current.x, y - current.y, z + 0.5 - current.z);
+        const floor = bot.blockAt(feetPos.offset(0, -1, 0));
+        const feet = bot.blockAt(feetPos);
+        const head = bot.blockAt(feetPos.offset(0, 1, 0));
+        const liquid = (b) => !!b && /water|lava/.test(String(b.name || '').toLowerCase());
+        if (floor && floor.boundingBox === 'block' && !liquid(floor) &&
+            feet && feet.boundingBox === 'empty' && !liquid(feet) &&
+            head && head.boundingBox === 'empty' && !liquid(head)) {
+          candidates.push({ x, y, z, score: Math.hypot((x + 0.5) - idealX, (z + 0.5) - idealZ) + Math.abs(y - preferredY) * 1.5 });
+        }
+      }
+    }
+    candidates.sort((a, b) => a.score - b.score);
+    return candidates[0] || null;
+  }
+
   function setFleeGoal(target, retreatDistance = fleeDistance) {
     if (!target || !target.position || !bot.entity || !bot.pathfinder) return;
-    let dx = bot.entity.position.x - target.position.x;
-    let dz = bot.entity.position.z - target.position.z;
+    const current = bot.entity.position;
+    let dx = current.x - target.position.x;
+    let dz = current.z - target.position.z;
     let length = Math.hypot(dx, dz);
     if (length < 0.25) {
-      // If the mob is directly on top of Manji, pick a direction instead of
-      // generating a zero-length escape vector.
       const angle = Math.random() * Math.PI * 2;
       dx = Math.cos(angle);
       dz = Math.sin(angle);
       length = 1;
     }
-    // A small sideways component avoids getting stuck against the same wall.
-    const side = (Math.random() - 0.5) * 0.45;
-    const nx = dx / length - (dz / length) * side;
-    const nz = dz / length + (dx / length) * side;
-    const destX = Math.floor(bot.entity.position.x + nx * retreatDistance);
-    const destZ = Math.floor(bot.entity.position.z + nz * retreatDistance);
-    const destY = Math.floor(bot.entity.position.y);
-    bot.pathfinder.setMovements(defaultMove);
-    bot.pathfinder.setGoal(new GoalNear(destX, destY, destZ, 2));
-    lastGoalRefresh = Date.now();
-    addLog(`[Combat] Fleeing from ${target.name || "hostile mob"}.`);
+    const awayAngle = Math.atan2(dz / length, dx / length);
+    const angleOffsets = [0, 0.65, -0.65, 1.25, -1.25, 1.8, -1.8, Math.PI];
+    const rotation = fleeRouteIndex++ % 2 === 0 ? 1 : -1;
+    const orderedOffsets = angleOffsets.map((value, index) => index === 0 ? 0 : value * rotation);
+    let selected = null;
+    let selectedScore = -Infinity;
+
+    for (const offset of orderedOffsets) {
+      const angle = awayAngle + offset;
+      const idealX = current.x + Math.cos(angle) * retreatDistance;
+      const idealZ = current.z + Math.sin(angle) * retreatDistance;
+      const candidate = findEscapeStandingSpot(idealX, idealZ, current.y);
+      if (!candidate) continue;
+      const dotAway = Math.cos(offset);
+      const distanceFromThreat = Math.hypot((candidate.x + 0.5) - target.position.x, (candidate.z + 0.5) - target.position.z);
+      if (dotAway < -0.2 || distanceFromThreat < distanceTo(target) + Math.min(4, retreatDistance * 0.3)) continue;
+      const score = dotAway * 10 - candidate.score - Math.abs(candidate.y - current.y) * 0.5;
+      if (score > selectedScore) {
+        selected = candidate;
+        selectedScore = score;
+      }
+    }
+
+    // If all local checks fail (for example, chunks are not fully loaded),
+    // still ask the pathfinder to escape rather than freezing beside the mob.
+    if (!selected) {
+      selected = {
+        x: Math.floor(current.x + (dx / length) * retreatDistance),
+        y: Math.floor(current.y),
+        z: Math.floor(current.z + (dz / length) * retreatDistance)
+      };
+    }
+
+    try {
+      bot.pathfinder.setMovements(defaultMove);
+      bot.pathfinder.setGoal(new GoalNear(selected.x, selected.y, selected.z, 2));
+      lastGoalRefresh = Date.now();
+      fleePlan = {
+        targetId: target.id,
+        destination: selected,
+        startedAt: Date.now(),
+        lastProgressAt: Date.now(),
+        lastPosition: current.clone(),
+        forceReplan: false
+      };
+      addLog(`[Combat] Escaping ${target.name || 'hostile mob'} via alternate route toward (${selected.x}, ${selected.y}, ${selected.z}).`);
+    } catch (e) {
+      addLog('[Combat] Could not set escape route:', e.message);
+      if (fleePlan) fleePlan.forceReplan = true;
+    }
   }
+
+  function fleeNeedsReplan(target) {
+    if (!fleePlan || fleePlan.targetId !== target.id || fleePlan.forceReplan) return true;
+    const now = Date.now();
+    const current = bot.entity.position;
+    const moved = current.distanceTo(fleePlan.lastPosition);
+    if (moved >= 0.4) {
+      fleePlan.lastPosition = current.clone();
+      fleePlan.lastProgressAt = now;
+    }
+    // Let a route run instead of resetting it every second. Only try another
+    // angle when the bot has truly stopped progressing or the route is stale.
+    return now - fleePlan.lastProgressAt > 2600 || now - fleePlan.startedAt > 12000;
+  }
+
+  bot.on('path_reset', (reason) => {
+    if (reason === 'stuck' && fleePlan) fleePlan.forceReplan = true;
+  });
+  bot.on('path_update', (result) => {
+    if (fleePlan && result && (result.status === 'noPath' || result.status === 'timeout')) {
+      fleePlan.forceReplan = true;
+    }
+  });
 
   async function controllerTick() {
     if (controllerBusy || !combatEnabled || !botState.connected || !bot.entity || !bot.pathfinder) return;
@@ -2183,6 +2342,7 @@ function damageReactionModule(bot, defaultMove) {
       if (targetChanged) {
         currentTargetId = target.id;
         lastGoalRefresh = 0;
+        fleePlan = null;
         creeperPhase = isCreeper ? (weaponAvailable ? "approach" : "retreat") : null;
       }
 
@@ -2204,7 +2364,7 @@ function damageReactionModule(bot, defaultMove) {
             stopCombat("unarmed creeper is far enough away");
             return;
           }
-          if (targetChanged || previousMode !== "flee" || Date.now() - lastGoalRefresh >= 1100) {
+          if (targetChanged || previousMode !== "flee" || fleeNeedsReplan(target)) {
             setFleeGoal(target, fleeDistance);
           }
           return;
@@ -2219,10 +2379,11 @@ function damageReactionModule(bot, defaultMove) {
             try { bot.pathfinder.setGoal(null); } catch (e) {}
             creeperPhase = "approach";
             currentMode = "creeper-approach";
+            fleePlan = null;
             lastGoalRefresh = 0;
             addLog("[Combat] Creeper at a safer distance; preparing another approach.");
           } else {
-            if (targetChanged || previousMode !== "creeper-retreat" || Date.now() - lastGoalRefresh >= 1000) {
+            if (targetChanged || previousMode !== "creeper-retreat" || fleeNeedsReplan(target)) {
               setFleeGoal(target, 10);
             }
             return;
@@ -2290,7 +2451,7 @@ function damageReactionModule(bot, defaultMove) {
           stopCombat("unarmed threat is far enough away");
           return;
         }
-        if (targetChanged || previousMode !== "flee" || Date.now() - lastGoalRefresh >= 1100) {
+        if (targetChanged || previousMode !== "flee" || fleeNeedsReplan(target)) {
           setFleeGoal(target, fleeDistance);
         }
         if (Date.now() - lastNoWeaponLog > 10000) {
