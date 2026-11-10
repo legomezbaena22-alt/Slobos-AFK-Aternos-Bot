@@ -1984,6 +1984,41 @@ function damageReactionModule(bot, defaultMove) {
       : Infinity;
   }
 
+  // Temporary diagnostics: observe Mineflayer's real entity classifications
+  // without changing combat, movement, equipment, or damage-reaction behaviour.
+  let lastEntityDiagnosticAt = 0;
+  function logEntityDiagnostics() {
+    const now = Date.now();
+    if (now - lastEntityDiagnosticAt < 5000 || !bot || !bot.entity || !bot.entities) return;
+    lastEntityDiagnosticAt = now;
+
+    const visible = Object.values(bot.entities).filter((entity) =>
+      entity && entity.id !== bot.entity.id && entity.position
+    ).map((entity) => ({
+      entity,
+      distance: distanceTo(entity),
+      name: String(entity.name || entity.displayName || 'unknown')
+    })).filter((entry) => entry.distance <= 24)
+      .sort((a, b) => a.distance - b.distance);
+
+    const hostileNameMatches = visible.filter((entry) =>
+      hostileMobs.has(String(entry.entity.name || '').toLowerCase())
+    );
+    const strictMatches = hostileNameMatches.filter((entry) => entry.entity.type === 'mob');
+    const nearbySummary = visible.slice(0, 18).map((entry) =>
+      `${String(entry.entity.type || 'unknown')}:${entry.name}#${entry.entity.id}@${entry.distance.toFixed(1)}`
+    );
+    const hostileSummary = hostileNameMatches.slice(0, 10).map((entry) =>
+      `${String(entry.entity.type || 'unknown')}:${entry.name}@${entry.distance.toFixed(1)}`
+    );
+    const weapons = bot.inventory && bot.inventory.items
+      ? bot.inventory.items().filter((item) => /_(sword|axe)$/.test(item.name)).map((item) => item.name)
+      : [];
+    const held = bot.heldItem ? bot.heldItem.name : 'empty';
+
+    addLog(`[CombatDiag] pathfinder=${!!bot.pathfinder}; nearby24=${visible.length}; hostileNames=${hostileNameMatches.length}; strictMobMatches=${strictMatches.length}; held=${held}; weapons=[${weapons.join(',') || 'none'}]; hostile=[${hostileSummary.join(', ') || 'none'}]; entities=[${nearbySummary.join(', ') || 'none'}]`);
+  }
+
   function getHostiles(maxDistance = Infinity) {
     if (!bot.entity || !bot.entities) return [];
     return Object.values(bot.entities).filter((entity) => {
@@ -2182,6 +2217,10 @@ function damageReactionModule(bot, defaultMove) {
   }
 
   if (combatEnabled) {
+    // Diagnostic-only observer. This runs independently from the combat loop,
+    // so it also tells us when the controller is returning early.
+    addInterval(() => logEntityDiagnostics(), 1000);
+
     // Scan continuously, not only after receiving damage. This is the key fix
     // for mobs standing nearby while Manji continues his idle route.
     addInterval(() => controllerTick(), 450);
