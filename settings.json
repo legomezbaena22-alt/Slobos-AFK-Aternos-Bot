@@ -16,8 +16,7 @@
     "x": -29.459,
     "y": 70.0,
     "z": 343.514,
-    "radius": 5,
-    "city-radius": 60
+    "radius": 5
   },
   "utils": {
     "auto-auth": {
@@ -48,7 +47,7 @@
   "movement": {
     "enabled": true,
     "circle-walk": {
-      "enabled": false,
+      "enabled": true,
       "radius": 4,
       "speed": 3000
     },
@@ -109,7 +108,7 @@
       ]
     },
     "self-defence": {
-      "enabled": true,
+      "enabled": false,
       "combat-radius": 8,
       "max-combat-ms": 30000,
       "player-retaliation-hits": 2,
