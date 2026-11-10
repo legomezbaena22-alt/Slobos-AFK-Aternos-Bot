@@ -1,7 +1,7 @@
 "use strict";
 
 const { addLog, getLogs } = require("./logger");
-const mineflayer = require("mineflayer");
+const mineflayer = require("@wp2508/mineflayer");
 const { Movements, pathfinder, goals } = require("mineflayer-pathfinder");
 const { GoalBlock } = goals;
 const config = require("./settings.json");
@@ -1206,12 +1206,10 @@ function createBot() {
   addLog(`[Bot] Connecting to ${config.server.ip}:${config.server.port}`);
 
   try {
-    // FIX: use version:false to auto-detect server version so the bot can join any server.
-    // If the user explicitly sets a version in settings.json it is still respected.
-    const botVersion =
-      config.server.version && config.server.version.trim() !== ""
-        ? config.server.version
-        : false;
+    // Minecraft 26.3 uses Java protocol 777. Pin the version so Mineflayer
+    // selects the matching protocol tables instead of relying on status autodetection.
+    const botVersion = config.server.version || "26.3";
+    addLog(`[Bot] Using Minecraft Java protocol version ${botVersion}`);
     bot = mineflayer.createBot({
       username: config["bot-account"].username,
       password: config["bot-account"].password || undefined,
@@ -1269,7 +1267,7 @@ function createBot() {
       }
 
       // FIX: use bot.version (auto-detected) instead of config value so minecraft-data always matches
-      const mcData = require("minecraft-data")(bot.version);
+      const mcData = require("@wp2508/minecraft-data")(bot.version);
       const defaultMove = new Movements(bot, mcData);
       defaultMove.allowFreeMotion = false;
       defaultMove.canDig = false;
@@ -1399,11 +1397,14 @@ function initializeModules(bot, mcData, defaultMove) {
 
   // ---------- AUTO AUTH (REACTIVE) ----------
   if (config.utils["auto-auth"] && config.utils["auto-auth"].enabled) {
-    const password = config.utils["auto-auth"].password;
+    const password = process.env.MC_AUTH_PASSWORD || config.utils["auto-auth"].password;
     let authHandled = false;
+    if (!password) {
+      addLog("[Auth] Auto-auth is enabled but no password is configured. Set MC_AUTH_PASSWORD in Railway Variables.");
+    }
 
     const tryAuth = (type) => {
-      if (authHandled || !bot || !botState.connected) return;
+      if (!password || authHandled || !bot || !botState.connected) return;
       authHandled = true;
       if (type === "register") {
         bot.chat(`/register ${password} ${password}`);
@@ -1434,7 +1435,7 @@ function initializeModules(bot, mcData, defaultMove) {
 
     // Failsafe: if no prompt after 10s, try login anyway
     setTimeout(() => {
-      if (!authHandled && bot && botState.connected) {
+      if (password && !authHandled && bot && botState.connected) {
         addLog(
           "[Auth] No prompt detected after 10s, sending /login as failsafe",
         );
@@ -2070,7 +2071,7 @@ addLog("=".repeat(50));
 addLog("  Minecraft AFK Bot v2.5 - Bug-Fixed Edition");
 addLog("=".repeat(50));
 addLog(`Server: ${config.server.ip}:${config.server.port}`);
-addLog(`Version: ${config.server.version}`);
+addLog(`Version: ${config.server.version || "26.3"}`);
 addLog(
   `Auto-Reconnect: ${config.utils["auto-reconnect"] ? "Enabled" : "Disabled"}`,
 );

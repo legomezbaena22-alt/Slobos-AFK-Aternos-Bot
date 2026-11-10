@@ -1,7 +1,7 @@
 {
   "name": "minecraft-afk-bot",
-  "version": "2.2",
-  "description": "Robust AFK bot for Minecraft servers with infinite uptime.",
+  "version": "2.3.0",
+  "description": "AFK bot for Minecraft Java 26.3 servers (including Java/Bedrock crossplay via server-side bridge).",
   "main": "index.js",
   "scripts": {
     "start": "node index.js",
@@ -11,8 +11,15 @@
   "license": "MIT",
   "dependencies": {
     "express": "^4.18.1",
-    "minecraft-data": "^3.103.0",
-    "mineflayer": "^4.34.0",
-    "mineflayer-pathfinder": "^2.1.1"
+    "mineflayer-pathfinder": "^2.1.1",
+    "@wp2508/mineflayer": "4.42.7",
+    "@wp2508/minecraft-data": "3.111.7"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "overrides": {
+    "minecraft-data": "npm:@wp2508/minecraft-data@3.111.7",
+    "prismarine-physics": "npm:@wp2508/prismarine-physics@1.12.4"
   }
 }

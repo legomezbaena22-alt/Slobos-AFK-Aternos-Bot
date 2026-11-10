@@ -8,7 +8,7 @@
   "server": {
     "ip": "BiggestWorld.aternos.me",
     "port": 63406,
-    "version": "",
+    "version": "26.3",
     "try-creative": false
   },
   "position": {
@@ -20,7 +20,7 @@
   "utils": {
     "auto-auth": {
       "enabled": true,
-      "password": "chalol78"
+      "password": ""
     },
     "anti-afk": {
       "enabled": true,
