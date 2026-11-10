@@ -13,9 +13,11 @@
   },
   "position": {
     "enabled": true,
-    "x": 0,
-    "y": 100,
-    "z": 0
+    "x": -29.459,
+    "y": 70.0,
+    "z": 343.514,
+    "radius": 5,
+    "city-radius": 60
   },
   "utils": {
     "auto-auth": {
@@ -46,7 +48,7 @@
   "movement": {
     "enabled": true,
     "circle-walk": {
-      "enabled": true,
+      "enabled": false,
       "radius": 4,
       "speed": 3000
     },
@@ -92,13 +94,26 @@
       "base-cooldown-ms": 5000,
       "rapid-cooldown-ms": 1800,
       "rapid-window-ms": 10000,
-      "messages": [
-        "¡Ouch!",
-        "¡Eh!",
-        "¡Ayuda!",
-        "¿Qué ha sido eso?",
-        "¡Parad!"
+      "attacker-radius": 4.0,
+      "player-messages": [
+        "¡Eh, {name}! ¿Qué haces?",
+        "¡Deja de pegarme, {name}!",
+        "¡Oye, que estoy aquí!",
+        "¡No hace falta ponerse así!"
+      ],
+      "mob-messages": [
+        "¡Un {mob} me está atacando!",
+        "¡Cuidado, un {mob}!",
+        "¡Que alguien me ayude con ese {mob}!",
+        "¡Aparta, {mob}!"
       ]
+    },
+    "self-defence": {
+      "enabled": true,
+      "combat-radius": 8,
+      "max-combat-ms": 30000,
+      "player-retaliation-hits": 2,
+      "flee-distance": 10
     }
   }
 }

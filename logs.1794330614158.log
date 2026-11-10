@@ -1,0 +1,43 @@
+2026-11-10T17:04:33.444597335Z [inf]  
+2026-11-10T17:04:33.444602015Z [inf]  > minecraft-afk-bot@2.2 start
+2026-11-10T17:04:33.444603605Z [inf]  [5:04:32 PM] [KeepAlive] No RENDER_EXTERNAL_URL set - self-ping disabled (running locally)
+2026-11-10T17:04:33.444612145Z [err]  npm warn config production Use `--omit=dev` instead.
+2026-11-10T17:04:33.444613045Z [inf]  > node index.js
+2026-11-10T17:04:33.444618335Z [inf]  [5:04:33 PM] ==================================================
+2026-11-10T17:04:33.444619615Z [inf]  
+2026-11-10T17:04:33.444623695Z [inf]  [5:04:33 PM]   Minecraft AFK Bot v2.5 - Bug-Fixed Edition
+2026-11-10T17:04:33.444983111Z [inf]  [5:04:33 PM] Auto-Reconnect: Enabled
+2026-11-10T17:04:33.444989821Z [inf]  [5:04:33 PM] ==================================================
+2026-11-10T17:04:33.444994131Z [inf]  [5:04:33 PM] [Bot] Creating bot instance...
+2026-11-10T17:04:33.444997511Z [inf]  [5:04:33 PM] [Bot] Connecting to BiggestWorld.aternos.me:63406
+2026-11-10T17:04:33.445000791Z [inf]  [5:04:33 PM] [Bot] Failed to create bot: unsupported protocol version: 26.3
+2026-11-10T17:04:33.445003971Z [inf]  [5:04:33 PM] [Bot] Reconnecting in 4.11s (attempt #1)
+2026-11-10T17:04:33.445006751Z [inf]  [5:04:33 PM] [Server] HTTP server started on port 8080 
+2026-11-10T17:04:33.445017081Z [inf]  [5:04:33 PM] ==================================================
+2026-11-10T17:04:33.445022721Z [inf]  [5:04:33 PM] Server: BiggestWorld.aternos.me:63406
+2026-11-10T17:04:33.445025981Z [inf]  [5:04:33 PM] Version: 26.3
+2026-11-10T17:04:33.468565762Z [inf]  Starting Container
+2026-11-10T17:04:37.154376688Z [inf]  [5:04:37 PM] [Bot] Creating bot instance...
+2026-11-10T17:04:37.154381888Z [inf]  [5:04:37 PM] [Bot] Connecting to BiggestWorld.aternos.me:63406
+2026-11-10T17:04:37.154385468Z [inf]  [5:04:37 PM] [Bot] Failed to create bot: unsupported protocol version: 26.3
+2026-11-10T17:04:37.154388508Z [inf]  [5:04:37 PM] [Bot] Reconnecting in 8.346s (attempt #2)
+2026-11-10T17:04:45.617255929Z [inf]  [5:04:45 PM] [Bot] Creating bot instance...
+2026-11-10T17:04:45.617268259Z [inf]  [5:04:45 PM] [Bot] Connecting to BiggestWorld.aternos.me:63406
+2026-11-10T17:04:45.617272719Z [inf]  [5:04:45 PM] [Bot] Failed to create bot: unsupported protocol version: 26.3
+2026-11-10T17:04:45.617275799Z [inf]  [5:04:45 PM] [Bot] Reconnecting in 17.633s (attempt #3)
+2026-11-10T17:05:05.573594927Z [inf]  [5:05:03 PM] [Bot] Creating bot instance...
+2026-11-10T17:05:05.573599877Z [inf]  [5:05:03 PM] [Bot] Connecting to BiggestWorld.aternos.me:63406
+2026-11-10T17:05:05.573603967Z [inf]  [5:05:03 PM] [Bot] Failed to create bot: unsupported protocol version: 26.3
+2026-11-10T17:05:05.573607627Z [inf]  [5:05:03 PM] [Bot] Reconnecting in 33.31s (attempt #4)
+2026-11-10T17:05:45.780992853Z [inf]  [5:05:36 PM] [Bot] Creating bot instance...
+2026-11-10T17:05:45.780996153Z [inf]  [5:05:36 PM] [Bot] Connecting to BiggestWorld.aternos.me:63406
+2026-11-10T17:05:45.780999303Z [inf]  [5:05:36 PM] [Bot] Failed to create bot: unsupported protocol version: 26.3
+2026-11-10T17:05:45.781104022Z [inf]  [5:05:36 PM] [Bot] Reconnecting in 65.843s (attempt #5)
+2026-11-10T17:06:45.786842944Z [inf]  [5:06:42 PM] [Bot] Creating bot instance...
+2026-11-10T17:06:45.786849164Z [inf]  [5:06:42 PM] [Bot] Connecting to BiggestWorld.aternos.me:63406
+2026-11-10T17:06:45.786852783Z [inf]  [5:06:42 PM] [Bot] Failed to create bot: unsupported protocol version: 26.3
+2026-11-10T17:06:45.786857253Z [inf]  [5:06:42 PM] [Bot] Reconnecting in 120.019s (attempt #6)
+2026-11-10T17:08:46.097879782Z [inf]  [5:08:42 PM] [Bot] Creating bot instance...
+2026-11-10T17:08:46.097885512Z [inf]  [5:08:42 PM] [Bot] Connecting to BiggestWorld.aternos.me:63406
+2026-11-10T17:08:46.097889822Z [inf]  [5:08:42 PM] [Bot] Failed to create bot: unsupported protocol version: 26.3
+2026-11-10T17:08:46.097893392Z [inf]  [5:08:42 PM] [Bot] Reconnecting in 120.759s (attempt #7)
