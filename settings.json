@@ -31,9 +31,11 @@
       "repeat": true,
       "repeat-delay": 120,
       "messages": [
-        "I'm a regular player",
-        "Subscribe to Slobos!",
-        "I like to play Minecraft!"
+       "¡BiggestWorld siempre tiene algo nuevo que explorar!",
+    "Hmm... creo que esta zona podría tener bastante potencial, ¿no?",
+    "Este servidor tiene mucho potencial.",
+    "Siempre hay algo que hacer en BiggestWorld.",
+    "La aventura continúa en BiggestWorld."
       ]
     },
     "chat-log": true,
