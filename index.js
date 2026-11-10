@@ -1395,6 +1395,9 @@ function scheduleReconnect() {
 function initializeModules(bot, mcData, defaultMove) {
   addLog("[Modules] Initializing all modules...");
 
+  // React to damage without attacking players or changing server gameplay.
+  damageReactionModule(bot);
+
   // ---------- AUTO AUTH (REACTIVE) ----------
   if (config.utils["auto-auth"] && config.utils["auto-auth"].enabled) {
     const password = process.env.MC_AUTH_PASSWORD || config.utils["auto-auth"].password;
@@ -1849,6 +1852,48 @@ function bedModule(bot, mcData) {
       addLog("[Bed] Error:", e.message);
     }
   }, 10000);
+}
+
+// Damage reaction module
+// Mineflayer emits entityHurt for the entity that received damage.
+function damageReactionModule(bot) {
+  const settings = config.interactions && config.interactions["damage-reactions"];
+  if (!settings || !settings.enabled) return;
+  const messages = Array.isArray(settings.messages) ? settings.messages : [];
+  if (!messages.length) return;
+
+  const baseCooldown = Math.max(1000, Number(settings["base-cooldown-ms"]) || 5000);
+  const rapidCooldown = Math.max(1000, Number(settings["rapid-cooldown-ms"]) || 1800);
+  const rapidWindow = Math.max(1000, Number(settings["rapid-window-ms"]) || 10000);
+  let lastReactionAt = 0;
+  let lastDamageAt = 0;
+  let previousMessage = null;
+
+  bot.on("entityHurt", (entity) => {
+    if (!bot || !botState.connected || !bot.entity || !entity) return;
+    if (entity.id !== bot.entity.id) return;
+
+    const now = Date.now();
+    const repeatedHits = now - lastDamageAt <= rapidWindow;
+    lastDamageAt = now;
+    const cooldown = repeatedHits ? rapidCooldown : baseCooldown;
+    if (now - lastReactionAt < cooldown) return;
+
+    let choices = messages;
+    if (messages.length > 1 && previousMessage !== null) {
+      choices = messages.filter((message) => message !== previousMessage);
+    }
+    const message = choices[Math.floor(Math.random() * choices.length)];
+    previousMessage = message;
+    lastReactionAt = now;
+
+    try {
+      bot.chat(message);
+      addLog(`[Interaction] Damage reaction sent: ${message}`);
+    } catch (e) {
+      addLog("[Interaction] Could not send damage reaction:", e.message);
+    }
+  });
 }
 
 // Chat module

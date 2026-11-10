@@ -1,7 +1,7 @@
 {
   "name": "AFK Bot",
   "bot-account": {
-    "username": "Slobot00",
+    "username": "Manji",
     "password": "",
     "type": "offline"
   },
@@ -29,13 +29,13 @@
     "chat-messages": {
       "enabled": true,
       "repeat": true,
-      "repeat-delay": 120,
+      "repeat-delay": 300,
       "messages": [
-       "¡BiggestWorld siempre tiene algo nuevo que explorar!",
-    "Hmm... creo que esta zona podría tener bastante potencial, ¿no?",
-    "Este servidor tiene mucho potencial.",
-    "Siempre hay algo que hacer en BiggestWorld.",
-    "La aventura continúa en BiggestWorld."
+        "¡BiggestWorld siempre tiene algo nuevo que explorar!",
+        "Hmm... creo que esta zona podría tener bastante potencial, ¿no?",
+        "Este servidor tiene mucho potencial.",
+        "Siempre hay algo que hacer en BiggestWorld.",
+        "La aventura continúa en BiggestWorld."
       ]
     },
     "chat-log": true,
@@ -85,5 +85,20 @@
   },
   "chat": {
     "respond": true
+  },
+  "interactions": {
+    "damage-reactions": {
+      "enabled": true,
+      "base-cooldown-ms": 5000,
+      "rapid-cooldown-ms": 1800,
+      "rapid-window-ms": 10000,
+      "messages": [
+        "¡Ouch!",
+        "¡Eh!",
+        "¡Ayuda!",
+        "¿Qué ha sido eso?",
+        "¡Parad!"
+      ]
+    }
   }
 }
