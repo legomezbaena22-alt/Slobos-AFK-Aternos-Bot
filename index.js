@@ -1889,13 +1889,13 @@ function damageReactionModule(bot, defaultMove) {
   const baseCooldown = Math.max(1000, Number(settings["base-cooldown-ms"]) || 5000);
   const rapidCooldown = Math.max(1000, Number(settings["rapid-cooldown-ms"]) || 1800);
   const rapidWindow = Math.max(1000, Number(settings["rapid-window-ms"]) || 10000);
-  const attackerRadius = Math.max(2, Number(settings["attacker-radius"]) || 4.5);
+  const attackerRadius = Math.max(2, Number(settings["attacker-radius"]) || 12);
   const combat = config.interactions["self-defence"] || {};
   const combatEnabled = combat.enabled !== false;
-  const combatRadius = Math.max(3, Number(combat["combat-radius"]) || 8);
+  const combatRadius = Math.max(3, Number(combat["combat-radius"]) || 16);
   const combatDuration = Math.max(5000, Number(combat["max-combat-ms"]) || 30000);
   const playerRetaliationHits = Math.max(1, Math.min(2, Number(combat["player-retaliation-hits"]) || 2));
-  const fleeDistance = Math.max(5, Number(combat["flee-distance"]) || 10);
+  const fleeDistance = Math.max(5, Number(combat["flee-distance"]) || 14);
 
   let lastReactionAt = 0;
   let lastDamageAt = 0;
@@ -2000,7 +2000,7 @@ function damageReactionModule(bot, defaultMove) {
   }
 
   async function fleeFrom(target) {
-    if (!target || !target.position || !bot.entity) return;
+    if (!target || !target.position || !bot.entity || !bot.pathfinder) return false;
     const dx = bot.entity.position.x - target.position.x;
     const dz = bot.entity.position.z - target.position.z;
     const length = Math.sqrt(dx * dx + dz * dz) || 1;
@@ -2009,11 +2009,18 @@ function damageReactionModule(bot, defaultMove) {
     const destY = Math.floor(bot.entity.position.y);
     try {
       bot.pathfinder.setMovements(defaultMove);
-      bot.pathfinder.setGoal(new GoalNear(destX, destY, destZ, 1));
-      addLog("[Combat] Manji is retreating from a player.");
+      bot.pathfinder.setGoal(new GoalNear(destX, destY, destZ, 2));
+      addLog(`[Combat] Manji is fleeing from ${target.name || "a hostile mob"} (no weapon or creeper).`);
+      return true;
     } catch (e) {
-      addLog("[Combat] Could not start retreat:", e.message);
+      addLog("[Combat] Could not start fleeing:", e.message);
+      return false;
     }
+  }
+
+  function hasWeapon() {
+    const items = bot.inventory && bot.inventory.items ? bot.inventory.items() : [];
+    return items.some((item) => /_(sword|axe)$/.test(item.name));
   }
 
   async function defendAgainst(target) {
@@ -2028,10 +2035,17 @@ function damageReactionModule(bot, defaultMove) {
     currentTargetId = target.id;
     const deadline = Date.now() + combatDuration;
     bot.__manjiCombatUntil = deadline;
+    let keepRetreatGoal = false;
     try {
       // Creepers are too dangerous to chase into melee range.
-      if (mobKey === "creeper") {
-        await fleeFrom(target);
+      // If Manji has no sword or axe, retreat instead of fighting bare-handed.
+      if (mobKey === "creeper" || !hasWeapon()) {
+        const fleeing = await fleeFrom(target);
+        if (fleeing) {
+          // Keep the retreat goal active; do not let finally cancel it immediately.
+          keepRetreatGoal = true;
+          await new Promise((resolve) => setTimeout(resolve, 5000));
+        }
         return;
       }
 
@@ -2072,7 +2086,7 @@ function damageReactionModule(bot, defaultMove) {
       addLog("[Combat] Counterattack error:", e.message);
     } finally {
       try {
-        if (bot.pathfinder && typeof bot.pathfinder.setGoal === "function") {
+        if (!keepRetreatGoal && bot.pathfinder && typeof bot.pathfinder.setGoal === "function") {
           bot.pathfinder.setGoal(null);
         }
       } catch (e) {}
