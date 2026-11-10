@@ -3,7 +3,7 @@
 const { addLog, getLogs } = require("./logger");
 const mineflayer = require("@wp2508/mineflayer");
 const { Movements, pathfinder, goals } = require("mineflayer-pathfinder");
-const { GoalBlock, GoalNear, GoalFollow } = goals;
+const { GoalBlock, GoalNear, GoalFollow, GoalCompositeAny } = goals;
 const config = require("./settings.json");
 const express = require("express");
 const http = require("http");
@@ -2228,6 +2228,15 @@ function damageReactionModule(bot, defaultMove) {
     return candidates[0] || null;
   }
 
+  let fleePlanRevision = 0;
+
+  function releaseMovementControls() {
+    if (typeof bot.setControlState !== "function") return;
+    for (const control of ["forward", "back", "left", "right", "sprint", "jump"]) {
+      try { bot.setControlState(control, false); } catch (e) {}
+    }
+  }
+
   function setFleeGoal(target, retreatDistance = fleeDistance) {
     if (!target || !target.position || !bot.entity || !bot.pathfinder) return;
     const current = bot.entity.position;
@@ -2241,70 +2250,116 @@ function damageReactionModule(bot, defaultMove) {
       length = 1;
     }
     const awayAngle = Math.atan2(dz / length, dx / length);
-    const angleOffsets = [0, 0.65, -0.65, 1.25, -1.25, 1.8, -1.8, Math.PI];
-    const rotation = fleeRouteIndex++ % 2 === 0 ? 1 : -1;
-    const orderedOffsets = angleOffsets.map((value, index) => index === 0 ? 0 : value * rotation);
-    let selected = null;
-    let selectedScore = -Infinity;
+    const currentThreatDistance = distanceTo(target);
 
+    // Give Pathfinder several safe retreat endpoints at once. GoalCompositeAny
+    // lets A* choose an endpoint it can actually reach, instead of insisting on
+    // one straight-away point that may sit behind a market wall or building.
+    // Rotate bearings and vary distance on every retry so a blocked route does
+    // not produce the same failed destination over and over.
+    const turn = fleePlanRevision % 2 === 0 ? 1 : -1;
+    const distanceScales = [1, 1.18, 0.9, 1.08];
+    const distanceScale = distanceScales[fleePlanRevision % distanceScales.length];
+    const baseOffsets = [0, 0.72, -0.72, 1.42, -1.42, 2.25, -2.25, Math.PI];
+    const rotationStart = fleePlanRevision % baseOffsets.length;
+    const orderedOffsets = baseOffsets.map((_, index) => baseOffsets[(index + rotationStart) % baseOffsets.length] * turn);
+    fleePlanRevision += 1;
+
+    const goalsToTry = [];
+    const destinationCandidates = [];
+    const used = new Set();
     for (const offset of orderedOffsets) {
       const angle = awayAngle + offset;
-      const idealX = current.x + Math.cos(angle) * retreatDistance;
-      const idealZ = current.z + Math.sin(angle) * retreatDistance;
+      const scaledDistance = retreatDistance * distanceScale;
+      const idealX = current.x + Math.cos(angle) * scaledDistance;
+      const idealZ = current.z + Math.sin(angle) * scaledDistance;
       const candidate = findEscapeStandingSpot(idealX, idealZ, current.y);
       if (!candidate) continue;
-      const dotAway = Math.cos(offset);
-      const distanceFromThreat = Math.hypot((candidate.x + 0.5) - target.position.x, (candidate.z + 0.5) - target.position.z);
-      if (dotAway < -0.2 || distanceFromThreat < distanceTo(target) + Math.min(4, retreatDistance * 0.3)) continue;
-      const score = dotAway * 10 - candidate.score - Math.abs(candidate.y - current.y) * 0.5;
-      if (score > selectedScore) {
-        selected = candidate;
-        selectedScore = score;
-      }
+      const key = `${candidate.x},${candidate.y},${candidate.z}`;
+      if (used.has(key)) continue;
+      used.add(key);
+
+      const threatDistance = Math.hypot(
+        (candidate.x + 0.5) - target.position.x,
+        (candidate.z + 0.5) - target.position.z
+      );
+      // Sideways movement is allowed to get around an obstacle, but the final
+      // escape point must still increase separation from the hostile mob.
+      if (threatDistance < currentThreatDistance + 1.5) continue;
+
+      goalsToTry.push(new GoalNear(candidate.x, candidate.y, candidate.z, 1));
+      destinationCandidates.push(candidate);
     }
 
-    // If all local checks fail (for example, chunks are not fully loaded),
-    // still ask the pathfinder to escape rather than freezing beside the mob.
-    if (!selected) {
-      selected = {
-        x: Math.floor(current.x + (dx / length) * retreatDistance),
-        y: Math.floor(current.y),
-        z: Math.floor(current.z + (dz / length) * retreatDistance)
+    // Cancel any stale straight-ahead control before assigning the new escape
+    // plan. If no safe point is available, stop and retry rather than pushing
+    // into the block and wasting the creeper's fuse time.
+    try { bot.pathfinder.setGoal(null); } catch (e) {}
+    releaseMovementControls();
+
+    if (goalsToTry.length === 0) {
+      fleePlan = {
+        targetId: target.id,
+        destinations: [],
+        startedAt: Date.now(),
+        lastProgressAt: Date.now(),
+        lastPosition: current.clone(),
+        forceReplan: false,
+        retryAt: Date.now() + 900
       };
+      addLog("[Combat] No safe escape point nearby; pausing briefly and checking another direction.");
+      return;
     }
 
     try {
       bot.pathfinder.setMovements(defaultMove);
-      bot.pathfinder.setGoal(new GoalNear(selected.x, selected.y, selected.z, 2));
+      const escapeGoal = goalsToTry.length === 1 ? goalsToTry[0] : new GoalCompositeAny(goalsToTry);
+      bot.pathfinder.setGoal(escapeGoal);
       lastGoalRefresh = Date.now();
       fleePlan = {
         targetId: target.id,
-        destination: selected,
+        destinations: destinationCandidates,
         startedAt: Date.now(),
         lastProgressAt: Date.now(),
         lastPosition: current.clone(),
-        forceReplan: false
+        forceReplan: false,
+        retryAt: 0
       };
-      addLog(`[Combat] Escaping ${target.name || 'hostile mob'} via alternate route toward (${selected.x}, ${selected.y}, ${selected.z}).`);
+      addLog(`[Combat] Escape route set with ${goalsToTry.length} alternative reachable-area targets around obstacles.`);
     } catch (e) {
-      addLog('[Combat] Could not set escape route:', e.message);
-      if (fleePlan) fleePlan.forceReplan = true;
+      addLog("[Combat] Could not set escape route:", e.message);
+      fleePlan = {
+        targetId: target.id,
+        destinations: [],
+        startedAt: Date.now(),
+        lastProgressAt: Date.now(),
+        lastPosition: current.clone(),
+        forceReplan: false,
+        retryAt: Date.now() + 900
+      };
     }
   }
 
   function fleeNeedsReplan(target) {
     if (!fleePlan || fleePlan.targetId !== target.id || fleePlan.forceReplan) return true;
     const now = Date.now();
+    if (fleePlan.retryAt) return now >= fleePlan.retryAt;
     const current = bot.entity.position;
     const moved = current.distanceTo(fleePlan.lastPosition);
-    if (moved >= 0.4) {
+    if (moved >= 0.35) {
       fleePlan.lastPosition = current.clone();
       fleePlan.lastProgressAt = now;
     }
-    // Let a route run instead of resetting it every second. Only try another
-    // angle when the bot has truly stopped progressing or the route is stale.
-    return now - fleePlan.lastProgressAt > 2600 || now - fleePlan.startedAt > 12000;
+    // Movement particles with almost no position change indicate the bot is
+    // pressing against a collision. Replan quickly with rotated alternatives.
+    if (now - fleePlan.lastProgressAt > 1700) {
+      fleePlan.forceReplan = true;
+      return true;
+    }
+    if (now - fleePlan.startedAt > 14000) return true;
+    return false;
   }
+
 
   bot.on('path_reset', (reason) => {
     if (reason === 'stuck' && fleePlan) fleePlan.forceReplan = true;
