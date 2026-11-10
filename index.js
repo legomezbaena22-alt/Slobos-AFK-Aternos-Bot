@@ -3,7 +3,7 @@
 const { addLog, getLogs } = require("./logger");
 const mineflayer = require("@wp2508/mineflayer");
 const { Movements, pathfinder, goals } = require("mineflayer-pathfinder");
-const { GoalBlock, GoalNear, GoalFollow, GoalCompositeAny } = goals;
+const { GoalBlock, GoalNear, GoalFollow } = goals;
 const config = require("./settings.json");
 const express = require("express");
 const http = require("http");
@@ -2061,11 +2061,23 @@ function damageReactionModule(bot, defaultMove) {
     return hostileMobs.has(String(entity.name || "").toLowerCase());
   }
 
+  // A hostile mob only becomes a combat target when Manji has a clear
+  // line of sight to it. This prevents underground/overhead mobs behind
+  // solid blocks from pulling the bot into combat or drawing its weapon.
+  function canSeeHostile(entity) {
+    if (!entity || !bot.entity || typeof bot.canSeeEntity !== "function") return false;
+    try {
+      return bot.canSeeEntity(entity) === true;
+    } catch (e) {
+      return false;
+    }
+  }
+
   function getHostiles(maxDistance = Infinity) {
     if (!bot.entity || !bot.entities) return [];
     return Object.values(bot.entities).filter((entity) => {
       if (!entity || entity.id === bot.entity.id || !entity.position) return false;
-      return isHostileMobEntity(entity) && distanceTo(entity) <= maxDistance;
+      return isHostileMobEntity(entity) && distanceTo(entity) <= maxDistance && canSeeHostile(entity);
     }).sort((a, b) => distanceTo(a) - distanceTo(b));
   }
 
@@ -2228,7 +2240,21 @@ function damageReactionModule(bot, defaultMove) {
     return candidates[0] || null;
   }
 
-  let fleePlanRevision = 0;
+  const blockedEscapeSpots = new Map();
+  const escapeRetryDelayMs = 1000;
+
+  function escapeSpotKey(point) {
+    return point ? `${point.x},${point.y},${point.z}` : "";
+  }
+
+  function markEscapeSpotBlocked(point, reason) {
+    if (!point) return;
+    blockedEscapeSpots.set(escapeSpotKey(point), Date.now() + 15000);
+    for (const [key, expiry] of blockedEscapeSpots) {
+      if (expiry <= Date.now()) blockedEscapeSpots.delete(key);
+    }
+    if (reason) addLog(`[Combat] Marked escape route as blocked (${reason}); testing another direction.`);
+  }
 
   function releaseMovementControls() {
     if (typeof bot.setControlState !== "function") return;
@@ -2250,92 +2276,103 @@ function damageReactionModule(bot, defaultMove) {
       length = 1;
     }
     const awayAngle = Math.atan2(dz / length, dx / length);
-    const currentThreatDistance = distanceTo(target);
 
-    // Give Pathfinder several safe retreat endpoints at once. GoalCompositeAny
-    // lets A* choose an endpoint it can actually reach, instead of insisting on
-    // one straight-away point that may sit behind a market wall or building.
-    // Rotate bearings and vary distance on every retry so a blocked route does
-    // not produce the same failed destination over and over.
-    const turn = fleePlanRevision % 2 === 0 ? 1 : -1;
-    const distanceScales = [1, 1.18, 0.9, 1.08];
-    const distanceScale = distanceScales[fleePlanRevision % distanceScales.length];
+    // Check several escape bearings. Crucially, each proposed destination is
+    // tested with Pathfinder before assigning it. A clear standing block on the
+    // other side of a wall is not enough: there must be a navigable route to it.
+    const turn = fleeRouteIndex++ % 2 === 0 ? 1 : -1;
     const baseOffsets = [0, 0.72, -0.72, 1.42, -1.42, 2.25, -2.25, Math.PI];
-    const rotationStart = fleePlanRevision % baseOffsets.length;
-    const orderedOffsets = baseOffsets.map((_, index) => baseOffsets[(index + rotationStart) % baseOffsets.length] * turn);
-    fleePlanRevision += 1;
+    const angleOffsets = baseOffsets.map((offset) => offset * turn);
+    const currentThreatDistance = distanceTo(target);
+    const candidates = [];
 
-    const goalsToTry = [];
-    const destinationCandidates = [];
-    const used = new Set();
-    for (const offset of orderedOffsets) {
+    for (const offset of angleOffsets) {
       const angle = awayAngle + offset;
-      const scaledDistance = retreatDistance * distanceScale;
-      const idealX = current.x + Math.cos(angle) * scaledDistance;
-      const idealZ = current.z + Math.sin(angle) * scaledDistance;
+      const idealX = current.x + Math.cos(angle) * retreatDistance;
+      const idealZ = current.z + Math.sin(angle) * retreatDistance;
       const candidate = findEscapeStandingSpot(idealX, idealZ, current.y);
       if (!candidate) continue;
-      const key = `${candidate.x},${candidate.y},${candidate.z}`;
-      if (used.has(key)) continue;
-      used.add(key);
+      const key = escapeSpotKey(candidate);
+      const blockedUntil = blockedEscapeSpots.get(key) || 0;
+      if (blockedUntil > Date.now()) continue;
 
       const threatDistance = Math.hypot(
         (candidate.x + 0.5) - target.position.x,
         (candidate.z + 0.5) - target.position.z
       );
-      // Sideways movement is allowed to get around an obstacle, but the final
-      // escape point must still increase separation from the hostile mob.
+      // Never choose a retreat destination that brings Manji materially closer
+      // to the threat. A little sideways movement is allowed to get around walls.
       if (threatDistance < currentThreatDistance + 1.5) continue;
 
-      goalsToTry.push(new GoalNear(candidate.x, candidate.y, candidate.z, 1));
-      destinationCandidates.push(candidate);
+      let route;
+      try {
+        route = bot.pathfinder.getPathTo(defaultMove, new GoalNear(candidate.x, candidate.y, candidate.z, 1), 350);
+      } catch (e) {
+        route = null;
+      }
+      if (!route || route.status !== "success" || !Array.isArray(route.path) || route.path.length === 0) {
+        // A no-path/timeout result is not a reason to walk straight at the wall.
+        blockedEscapeSpots.set(key, Date.now() + 5000);
+        continue;
+      }
+
+      const pathLength = route.path.length;
+      const awayGain = threatDistance - currentThreatDistance;
+      const sideStepPenalty = Math.abs(offset) * 0.8;
+      const heightPenalty = Math.abs(candidate.y - current.y) * 1.2;
+      const score = awayGain * 2.5 - pathLength * 0.22 - sideStepPenalty - heightPenalty;
+      candidates.push({ candidate, score, pathLength, threatDistance, offset });
     }
 
-    // Cancel any stale straight-ahead control before assigning the new escape
-    // plan. If no safe point is available, stop and retry rather than pushing
-    // into the block and wasting the creeper's fuse time.
+    candidates.sort((a, b) => b.score - a.score);
+    const selected = candidates.length ? candidates[0].candidate : null;
+
+    // Always cancel a failed route and release any residual forward input. If no
+    // reachable escape point is known, wait briefly and retry instead of running
+    // continuously into the same wall.
     try { bot.pathfinder.setGoal(null); } catch (e) {}
     releaseMovementControls();
 
-    if (goalsToTry.length === 0) {
+    if (!selected) {
       fleePlan = {
         targetId: target.id,
-        destinations: [],
+        destination: null,
         startedAt: Date.now(),
         lastProgressAt: Date.now(),
         lastPosition: current.clone(),
         forceReplan: false,
-        retryAt: Date.now() + 900
+        retryAt: Date.now() + escapeRetryDelayMs
       };
-      addLog("[Combat] No safe escape point nearby; pausing briefly and checking another direction.");
+      addLog("[Combat] No reachable escape route found; stopping briefly and retrying instead of pushing into an obstacle.");
       return;
     }
 
     try {
       bot.pathfinder.setMovements(defaultMove);
-      const escapeGoal = goalsToTry.length === 1 ? goalsToTry[0] : new GoalCompositeAny(goalsToTry);
-      bot.pathfinder.setGoal(escapeGoal);
+      bot.pathfinder.setGoal(new GoalNear(selected.x, selected.y, selected.z, 1));
       lastGoalRefresh = Date.now();
       fleePlan = {
         targetId: target.id,
-        destinations: destinationCandidates,
+        destination: selected,
         startedAt: Date.now(),
         lastProgressAt: Date.now(),
         lastPosition: current.clone(),
         forceReplan: false,
         retryAt: 0
       };
-      addLog(`[Combat] Escape route set with ${goalsToTry.length} alternative reachable-area targets around obstacles.`);
+      const chosen = candidates[0];
+      addLog(`[Combat] Escaping ${target.name || "hostile mob"} using reachable detour toward (${selected.x}, ${selected.y}, ${selected.z}); route length=${chosen.pathLength}.`);
     } catch (e) {
       addLog("[Combat] Could not set escape route:", e.message);
+      markEscapeSpotBlocked(selected, "goal assignment failed");
       fleePlan = {
         targetId: target.id,
-        destinations: [],
+        destination: null,
         startedAt: Date.now(),
         lastProgressAt: Date.now(),
         lastPosition: current.clone(),
         forceReplan: false,
-        retryAt: Date.now() + 900
+        retryAt: Date.now() + escapeRetryDelayMs
       };
     }
   }
@@ -2350,22 +2387,31 @@ function damageReactionModule(bot, defaultMove) {
       fleePlan.lastPosition = current.clone();
       fleePlan.lastProgressAt = now;
     }
-    // Movement particles with almost no position change indicate the bot is
-    // pressing against a collision. Replan quickly with rotated alternatives.
-    if (now - fleePlan.lastProgressAt > 1700) {
+    // If there is almost no physical displacement, mark that exact destination
+    // as failed before replanning. This prevents repeatedly choosing the same
+    // straight-away vector when a market wall or building blocks it.
+    if (now - fleePlan.lastProgressAt > 1800) {
+      if (fleePlan.destination) markEscapeSpotBlocked(fleePlan.destination, "no movement progress");
       fleePlan.forceReplan = true;
       return true;
     }
-    if (now - fleePlan.startedAt > 14000) return true;
+    if (now - fleePlan.startedAt > 14000) {
+      if (fleePlan.destination) markEscapeSpotBlocked(fleePlan.destination, "route expired");
+      return true;
+    }
     return false;
   }
 
 
   bot.on('path_reset', (reason) => {
-    if (reason === 'stuck' && fleePlan) fleePlan.forceReplan = true;
+    if (reason === 'stuck' && fleePlan) {
+      if (fleePlan.destination) markEscapeSpotBlocked(fleePlan.destination, 'pathfinder stuck');
+      fleePlan.forceReplan = true;
+    }
   });
   bot.on('path_update', (result) => {
     if (fleePlan && result && (result.status === 'noPath' || result.status === 'timeout')) {
+      if (fleePlan.destination) markEscapeSpotBlocked(fleePlan.destination, result.status);
       fleePlan.forceReplan = true;
     }
   });
@@ -2380,7 +2426,7 @@ function damageReactionModule(bot, defaultMove) {
 
       // Continue the existing target briefly even if it has moved just beyond
       // the scan radius, so a fight/retreat is not cancelled between scans.
-      if (!target && active && active.position && distanceTo(active) <= combatRadius) target = active;
+      if (!target && active && active.position && distanceTo(active) <= combatRadius && canSeeHostile(active)) target = active;
       if (!target) {
         stopCombat("no hostile mobs nearby");
         return;
