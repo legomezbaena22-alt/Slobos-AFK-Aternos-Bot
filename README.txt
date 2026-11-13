@@ -20,18 +20,18 @@ QUÉ CAMBIA EN v10
 - El botón Stop del panel detiene Manji; Start lo inicia otra vez.
 
 CONFIGURACIÓN PARA RAILWAY + SERVIDOR EN CASA
-IMPORTANTE: Railway no puede usar 127.0.0.1 para llegar al ordenador de casa.
+IMPORTANTE: Railway no puede usar BiggestWorld.aternos.me para llegar al ordenador de casa.
 Ese localhost apunta al propio contenedor de Railway.
 
 En Railway > Variables, configura:
   MC_HOST   = IP pública de tu casa o nombre DDNS
-  MC_PORT   = puerto TCP del servidor Minecraft (normalmente 25565)
+  MC_PORT   = puerto TCP del servidor Minecraft (normalmente 63406)
   MC_VERSION= 26.3
   MC_USERNAME = Manji (opcional; sustituye el usuario de settings.json)
   MC_AUTH   = offline (solo si el servidor acepta cuentas offline)
 
 Si Manji se ejecuta en el mismo ordenador que el servidor, el valor por defecto
-127.0.0.1:25565 puede funcionar sin abrir puertos. Pero desde Railway necesitas:
+BiggestWorld.aternos.me:63406 puede funcionar sin abrir puertos. Pero desde Railway necesitas:
 1. Que el servidor escuche en su puerto de juego normal.
 2. Dejar server-ip= vacío en server.properties.
 3. Redirigir SOLO el puerto TCP de Minecraft desde el router al PC del servidor.
