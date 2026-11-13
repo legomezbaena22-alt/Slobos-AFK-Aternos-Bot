@@ -5,12 +5,22 @@ const mineflayer = require("@wp2508/mineflayer");
 const { Movements, pathfinder, goals } = require("mineflayer-pathfinder");
 const { GoalBlock, GoalNear, GoalFollow, GoalCompositeAny } = goals;
 const config = require("./settings.json");
+// Local-home-server deployment: Railway must receive the public host/port via
+// environment variables. A Railway container's localhost is NOT the user's PC.
+config.server.ip = process.env.MC_HOST || config.server.ip;
+config.server.port = Number(process.env.MC_PORT || config.server.port || 25565);
+config.server.version = process.env.MC_VERSION || config.server.version;
+config["bot-account"].username = process.env.MC_USERNAME || config["bot-account"].username;
+config["bot-account"].type = process.env.MC_AUTH || config["bot-account"].type;
+if (!config.server.ip || !Number.isInteger(config.server.port) || config.server.port < 1 || config.server.port > 65535) {
+  throw new Error("Invalid Minecraft destination. Check MC_HOST and MC_PORT (valid TCP port: 1-65535).");
+}
 const express = require("express");
 const http = require("http");
 const https = require("https");
 
 // ============================================================
-// EXPRESS SERVER - Keep Render/Aternos alive
+// EXPRESS SERVER - Manji local-server control panel
 // ============================================================
 const app = express();
 app.use(express.json());
@@ -413,19 +423,19 @@ app.get("/tutorial", (req, res) => {
 
           <header>
             <h1>Setup Guide</h1>
-            <p>Get your AFK bot running in under 15 minutes</p>
+            <p>Connect Manji to your own Java server</p>
           </header>
 
           <div class="step-card">
             <div class="step-header">
               <div class="step-number">1</div>
-              <h2 class="step-title">Configure Aternos</h2>
+              <h2 class="step-title">Configure your home Minecraft server</h2>
             </div>
             <ol>
-              <li>Go to <strong>Aternos</strong> and open your server.</li>
-              <li>Install <strong>Paper/Bukkit</strong> as your server software.</li>
-              <li>Enable <strong>Cracked</strong> mode using the green switch.</li>
-              <li>Install these plugins: <code>ViaVersion</code>, <code>ViaBackwards</code>, <code>ViaRewind</code></li>
+              <li>Start your own Java server and keep its game port reachable from Railway.</li>
+              <li>In <code>server.properties</code>, set <code>player-idle-timeout=0</code>.</li>
+              <li>Keep <code>server-ip=</code> empty and use your normal game port (usually <code>25565</code>).</li>
+              <li>Leave the server's online authentication enabled when using a licensed Microsoft account.</li>
             </ol>
           </div>
 
@@ -444,18 +454,18 @@ app.get("/tutorial", (req, res) => {
           <div class="step-card">
             <div class="step-header">
               <div class="step-number">3</div>
-              <h2 class="step-title">Deploy on Replit (Free 24/7)</h2>
+              <h2 class="step-title">Deploy on Railway</h2>
             </div>
             <ol>
-              <li>Import your GitHub repo into <strong>Replit</strong>.</li>
-              <li>Set the run command to <code>npm start</code>.</li>
-              <li>Hit <strong>Run</strong> — the bot connects automatically.</li>
-              <li>The bot pings itself every 10 minutes to stay alive.</li>
+              <li>Connect your GitHub repository to <strong>Railway</strong> and deploy it with <code>npm start</code>.</li>
+              <li>In Railway Variables, set <code>MC_HOST</code> to your home's public IP or DDNS name.</li>
+              <li>Set <code>MC_PORT</code> to your forwarded Minecraft TCP port, commonly <code>25565</code>.</li>
+              <li>Use Railway's dashboard Stop control when you want Manji to disconnect.</li>
             </ol>
           </div>
 
           <footer>
-            <p>AFK Bot Dashboard &middot; ${config.name}</p>
+            <p>Manji Local Dashboard &middot; ${config.name}</p>
           </footer>
         </main>
       </body>
@@ -796,7 +806,7 @@ app.get("/logs", (req, res) => {
           </div>
 
           <footer>
-            <p>AFK Bot Dashboard &middot; ${config.name}</p>
+            <p>Manji Local Dashboard &middot; ${config.name}</p>
           </footer>
         </main>
 
@@ -975,12 +985,16 @@ app.get("/logs", (req, res) => {
 
 let botRunning = true;
 
+// Manji Local mode: autonomous movement/combat remains active with zero human players.
+
 app.post("/start", (req, res) => {
   if (botRunning) return res.json({ success: false, msg: "Already running" });
 
   botRunning = true;
+  isReconnecting = false;
+  clearBotTimeouts();
   createBot();
-  addLog("[Control] Bot started");
+  addLog("[Control] Bot started manually from dashboard");
 
   res.json({ success: true });
 });
@@ -989,13 +1003,18 @@ app.post("/stop", (req, res) => {
   if (!botRunning) return res.json({ success: false, msg: "Already stopped" });
 
   botRunning = false;
+  isReconnecting = false;
+  clearBotTimeouts();
+  clearAllIntervals();
 
   if (bot) {
-    bot.end();
+    const activeBot = bot;
     bot = null;
+    try { activeBot.quit("Stopped from Manji dashboard"); } catch (e) {
+      try { activeBot.end(); } catch (_) {}
+    }
   }
 
-  clearAllIntervals();
   addLog("[Control] Bot stopped");
 
   res.json({ success: true });
@@ -1075,7 +1094,7 @@ server.on("error", (err) => {
   }
 });
 
-// FIX: only one definition of formatUptime
+// Format bot uptime for the dashboard
 function formatUptime(seconds) {
   const h = Math.floor(seconds / 3600);
   const m = Math.floor((seconds % 3600) / 60);
@@ -1084,33 +1103,8 @@ function formatUptime(seconds) {
 }
 
 // ============================================================
-// SELF-PING - Prevent Render from sleeping
-// FIX: only ping if RENDER_EXTERNAL_URL is set (skip useless localhost ping)
-// ============================================================
-const SELF_PING_INTERVAL = 10 * 60 * 1000;
+// HTTP health endpoint for Railway monitoring; no self-ping loop is used.
 
-function startSelfPing() {
-  const renderUrl = process.env.RENDER_EXTERNAL_URL;
-  if (!renderUrl) {
-    addLog(
-      "[KeepAlive] No RENDER_EXTERNAL_URL set - self-ping disabled (running locally)",
-    );
-    return;
-  }
-  setInterval(() => {
-    const protocol = renderUrl.startsWith("https") ? https : http;
-    protocol
-      .get(`${renderUrl}/ping`, (res) => {
-        // Silent success
-      })
-      .on("error", (err) => {
-        addLog(`[KeepAlive] Self-ping failed: ${err.message}`);
-      });
-  }, SELF_PING_INTERVAL);
-  addLog("[KeepAlive] Self-ping system started (every 10 min)");
-}
-
-startSelfPing();
 
 // ============================================================
 // MEMORY MONITORING
@@ -1125,15 +1119,13 @@ setInterval(
 );
 
 // ============================================================
-// BOT CREATION WITH RECONNECTION LOGIC
-// ============================================================
-// ============================================================
-// RECONNECTION & TIMEOUT MANAGEMENT
+// BOT CREATION AND RECONNECTION MANAGEMENT
 // ============================================================
 let bot = null;
 let activeIntervals = [];
 let reconnectTimeoutId = null;
 let connectionTimeoutId = null;
+let stableConnectionTimerId = null;
 let isReconnecting = false;
 
 function clearBotTimeouts() {
@@ -1144,6 +1136,10 @@ function clearBotTimeouts() {
   if (connectionTimeoutId) {
     clearTimeout(connectionTimeoutId);
     connectionTimeoutId = null;
+  }
+  if (stableConnectionTimerId) {
+    clearTimeout(stableConnectionTimerId);
+    stableConnectionTimerId = null;
   }
 }
 
@@ -1185,6 +1181,10 @@ function getReconnectDelay() {
 }
 
 function createBot() {
+  if (!botRunning) {
+    addLog("[Bot] Start ignored because the bot is stopped. Use the dashboard Start button.");
+    return;
+  }
   if (isReconnecting) {
     addLog("[Bot] Already reconnecting, skipping...");
     return;
@@ -1218,12 +1218,21 @@ function createBot() {
       port: config.server.port,
       version: botVersion,
       hideErrors: false,
-      checkTimeoutInterval: 600000,
+      keepAlive: true,
+      checkTimeoutInterval: 60000,
+      respawn: true,
     });
 
     bot.loadPlugin(pathfinder);
 
-    // FIX: connection timeout - end the old bot before reconnecting to avoid ghost bots
+    bot.on("death", () => {
+      addLog("[Bot] Death detected; Mineflayer automatic respawn is enabled.");
+    });
+    bot.on("respawn", () => {
+      addLog("[Bot] Respawn transition received; movement controller will continue after spawn.");
+    });
+
+    // Connection timeout - end the old bot before reconnecting to avoid ghost bots
     clearBotTimeouts();
     connectionTimeoutId = setTimeout(() => {
       if (!botState.connected) {
@@ -1237,9 +1246,9 @@ function createBot() {
         bot = null;
         scheduleReconnect();
       }
-    }, 150000); // 150s - Aternos servers can take 90-120s to finish spawning a player
+    }, 120000); // 120s connection window for a local server booting or loading chunks
 
-    // FIX: guard against spawn firing twice (can happen on some servers)
+    // Each bot instance handles its first spawn once; reconnections create a fresh instance.
     let spawnHandled = false;
 
     bot.once("spawn", () => {
@@ -1249,8 +1258,14 @@ function createBot() {
       clearBotTimeouts();
       botState.connected = true;
       botState.lastActivity = Date.now();
-      botState.reconnectAttempts = 0;
       isReconnecting = false;
+      // Do not reset retry backoff on a short-lived connection. Reset only
+      // after two stable minutes to avoid rapid reconnect loops on flapping links.
+      stableConnectionTimerId = setTimeout(() => {
+        stableConnectionTimerId = null;
+        if (botState.connected) botState.reconnectAttempts = 0;
+      }, 120000);
+      addLog("[Local] Autonomous mode enabled: Manji remains connected and active without human players.");
 
       addLog(
         `[Bot] [+] Successfully spawned on server! (Version: ${bot.version})`,
@@ -1266,20 +1281,19 @@ function createBot() {
         );
       }
 
-      // FIX: use bot.version (auto-detected) instead of config value so minecraft-data always matches
+      // Use the negotiated bot.version so minecraft-data matches the server
       const mcData = require("@wp2508/minecraft-data")(bot.version);
       const defaultMove = new Movements(bot, mcData);
       defaultMove.allowFreeMotion = false;
       defaultMove.canDig = false;
-      // Keep movement grounded and natural: stairs/normal steps remain usable,
-      // but Manji will not pillar up 1x1 towers or make parkour leaps.
+      // Safe, conservative navigation. Keep stairs and ordinary one-block
+      // steps; never dig, pillar, or parkour. Swimming remains available as a
+      // recovery route, but dry paths are preferred by a moderate liquid cost.
       defaultMove.allow1by1towers = false;
       defaultMove.allowParkour = false;
       defaultMove.maxDropDown = 3;
-      // Avoid autonomous swimming; riding in a boat remains possible.
-      defaultMove.canSwim = false;
-      defaultMove.liquidCost = 1000;
-      defaultMove.fallDamageCost = 1000;
+      defaultMove.liquidCost = 5;
+      defaultMove.allowSprinting = true;
 
       initializeModules(bot, mcData, defaultMove);
 
@@ -1342,6 +1356,7 @@ function createBot() {
     bot.on("end", (reason) => {
       addLog(`[Bot] Disconnected: ${reason || "Unknown reason"}`);
       botState.connected = false;
+      clearBotTimeouts();
       clearAllIntervals();
       spawnHandled = false; // reset for next connection
 
@@ -1356,8 +1371,14 @@ function createBot() {
         );
       }
 
-      // ALWAYS reconnect — bot must never leave the server
-      scheduleReconnect();
+      // Local-server mode: keep the service in desired-running state and retry
+      // with exponential backoff until the user presses Stop in the dashboard.
+      if (botRunning && config.utils["auto-reconnect"] === true) {
+        scheduleReconnect();
+      } else {
+        botRunning = false;
+        addLog("[Bot] Automatic reconnection is disabled; use the dashboard Start button.");
+      }
     });
 
     bot.on("error", (err) => {
@@ -1374,6 +1395,13 @@ function createBot() {
 
 function scheduleReconnect() {
   clearBotTimeouts();
+
+  if (!botRunning || config.utils["auto-reconnect"] !== true) {
+    botRunning = false;
+    isReconnecting = false;
+    addLog("[Bot] Reconnect skipped: automatic reconnection is disabled.");
+    return;
+  }
 
   // FIX: don't stack reconnect if already waiting
   if (isReconnecting) {
@@ -1735,9 +1763,10 @@ function startProceduralMovement(bot, defaultMove) {
     if (currentGoal) {
       const goalDistance = Math.hypot(
         position.x - (currentGoal.x + 0.5),
+        position.y - currentGoal.y,
         position.z - (currentGoal.z + 0.5)
       );
-      if (goalDistance <= 1.45) {
+      if (goalDistance <= 1.6) {
         try { bot.pathfinder.setGoal(null); } catch (e) {}
         currentGoal = null;
         nextActionAt = now + 1600 + Math.floor(Math.random() * 4300);
@@ -1754,11 +1783,11 @@ function startProceduralMovement(bot, defaultMove) {
       // wall, so movement need not reduce straight-line distance to the waypoint;
       // but if the position stays almost fixed, cancel before it keeps pushing.
       const physicalDisplacement = position.distanceTo(lastPosition);
-      if (physicalDisplacement >= 0.22) {
+      if (physicalDisplacement >= 0.14) {
         lastPosition = position.clone();
         lastProgressAt = now;
       }
-      if (now - lastProgressAt > 2600 || now - goalStartedAt > 30000) {
+      if (now - lastProgressAt > 4200 || now - goalStartedAt > 45000) {
         abandonCurrentGoal('no physical movement / blocked route');
       }
       return;
@@ -1804,6 +1833,7 @@ function startRandomJump(bot) {
     if (
       !bot ||
       !botState.connected ||
+      
       typeof bot.setControlState !== "function"
     )
       return;
@@ -2818,11 +2848,11 @@ process.on("uncaughtException", (err) => {
     addLog("[FATAL] Known network/protocol error - recovering gracefully...");
   }
 
-  // ALWAYS recover — bot must never stay disconnected
+  // Recover only when automatic reconnection is explicitly enabled
   clearAllIntervals();
   botState.connected = false;
 
-  // FIX: reset isReconnecting if it was stuck, then schedule reconnect
+  // Reset reconnect state before applying the configured reconnect policy
   if (isReconnecting) {
     addLog(
       "[FATAL] isReconnecting was stuck - resetting before crash recovery",
@@ -2871,25 +2901,42 @@ process.on("unhandledRejection", (reason) => {
   }
 });
 
-process.on("SIGTERM", () => {
-  addLog("[System] SIGTERM received — ignoring, bot will stay alive.");
-});
+let shutdownStarted = false;
+function gracefulShutdown(signal) {
+  if (shutdownStarted) return;
+  shutdownStarted = true;
+  addLog(`[System] ${signal} received; shutting down cleanly.`);
+  botRunning = false;
+  clearBotTimeouts();
+  clearAllIntervals();
+  const activeBot = bot;
+  bot = null;
+  if (activeBot) {
+    try { activeBot.quit(`Process ${signal}`); } catch (e) {
+      try { activeBot.end(); } catch (_) {}
+    }
+  }
+  server.close(() => process.exit(0));
+  setTimeout(() => process.exit(0), 5000).unref();
+}
 
-process.on("SIGINT", () => {
-  addLog("[System] SIGINT received — ignoring, bot will stay alive.");
-});
+process.on("SIGTERM", () => gracefulShutdown("SIGTERM"));
+process.on("SIGINT", () => gracefulShutdown("SIGINT"));
 
 // =============================
 //===============================
 // START THE BOT
 // ============================================================
 addLog("=".repeat(50));
-addLog("  Minecraft AFK Bot v2.5 - Bug-Fixed Edition");
+addLog("  Manji Local v10 - Persistent Home Server Edition");
 addLog("=".repeat(50));
 addLog(`Server: ${config.server.ip}:${config.server.port}`);
+if (!process.env.MC_HOST && ["127.0.0.1", "localhost", "::1"].includes(String(config.server.ip).toLowerCase())) {
+  addLog("[Config] MC_HOST is not set. This address only works when Manji runs on the same machine as Minecraft; on Railway set MC_HOST to your home's reachable public IP or DDNS name.");
+}
 addLog(`Version: ${config.server.version || "26.3"}`);
 addLog(
-  `Auto-Reconnect: ${config.utils["auto-reconnect"] ? "Enabled" : "Disabled"}`,
+  `Auto-Reconnect: ${config.utils["auto-reconnect"] ? "Enabled (exponential backoff)" : "Disabled (manual start)"}`,
 );
 addLog("=".repeat(50));
 

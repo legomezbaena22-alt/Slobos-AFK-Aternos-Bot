@@ -1,13 +1,13 @@
 {
-  "name": "AFK Bot",
+  "name": "Manji Local 24h",
   "bot-account": {
     "username": "Manji",
     "password": "",
     "type": "offline"
   },
   "server": {
-    "ip": "BiggestWorld.aternos.me",
-    "port": 63406,
+    "ip": "127.0.0.1",
+    "port": 25565,
     "version": "26.3",
     "try-creative": false
   },
@@ -28,7 +28,7 @@
       "sneak": false
     },
     "chat-messages": {
-      "enabled": true,
+      "enabled": false,
       "repeat": true,
       "repeat-delay": 300,
       "messages": [
@@ -41,7 +41,7 @@
     },
     "chat-log": true,
     "auto-reconnect": true,
-    "auto-reconnect-delay": 2000,
+    "auto-reconnect-delay": 5000,
     "max-reconnect-delay": 120000
   },
   "movement": {
