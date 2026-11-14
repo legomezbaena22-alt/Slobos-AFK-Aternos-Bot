@@ -1,6 +1,20 @@
 "use strict";
 
 const { addLog, getLogs } = require("./logger");
+const path = require("node:path");
+const { AgentMemory } = require("./memory/agent-memory");
+const { ActivityBrain } = require("./brain/activity-brain");
+const { SensorSuite } = require("./perception/sensor-suite");
+const { RoutePlanner } = require("./navigation/route-planner");
+const { planWaypointWithFallback } = require("./navigation/waypoint-recovery");
+const { WeaponController, withTimeout } = require("./combat/weapon-controller");
+const { ArmorController, canRunArmorTransaction } = require("./combat/armor-controller");
+const { selectCombatTarget } = require("./combat/target-lock");
+const { buildApproachCandidates } = require("./combat/approach-recovery");
+const { buildCombatDetourCandidates } = require("./navigation/combat-detour");
+const { buildCornerEscapeCandidates, canInterruptForCornerRecovery } = require("./navigation/corner-recovery");
+const { findIncomingProjectile, buildLateralDodgePoints } = require("./combat/projectile-defense");
+const { isPermanentConnectionFailure, isRecoverableNetworkFailure, reconnectAfterKick } = require("./connection/failure-policy");
 const mineflayer = require("@wp2508/mineflayer");
 const { Movements, pathfinder, goals } = require("mineflayer-pathfinder");
 const { GoalBlock, GoalNear, GoalFollow, GoalCompositeAny } = goals;
@@ -8,7 +22,12 @@ const config = require("./settings.json");
 // Local-home-server deployment: Railway must receive the public host/port via
 // environment variables. A Railway container's localhost is NOT the user's PC.
 config.server.ip = process.env.MC_HOST || config.server.ip;
-config.server.port = Number(process.env.MC_PORT || config.server.port || 25565);
+// Deliberately do not silently fall back to 25565 or localhost. The committed
+// settings.json keeps the user's requested default until explicitly changed.
+const configuredPort = process.env.MC_PORT && String(process.env.MC_PORT).trim() !== ""
+  ? process.env.MC_PORT
+  : config.server.port;
+config.server.port = Number(configuredPort);
 config.server.version = process.env.MC_VERSION || config.server.version;
 config["bot-account"].username = process.env.MC_USERNAME || config["bot-account"].username;
 config["bot-account"].type = process.env.MC_AUTH || config["bot-account"].type;
@@ -18,6 +37,53 @@ if (!config.server.ip || !Number.isInteger(config.server.port) || config.server.
 const express = require("express");
 const http = require("http");
 const https = require("https");
+
+const memoryDirectory = process.env.MANJI_DATA_DIR || path.join(__dirname, "data");
+const memoryFile = process.env.MANJI_MEMORY_FILE || path.join(memoryDirectory, "manji-memory.json");
+const manjiMemory = new AgentMemory({ filePath: memoryFile });
+
+// A filesystem lock prevents duplicate processes sharing the same data directory.
+// On Railway, also keep the service replica count at exactly one: separate
+// containers do not share a local lock file unless a shared volume is mounted.
+// Keep the process lock on the container/local filesystem, not on the persistent
+// memory volume. A stale lock must not survive a Railway redeploy in /data.
+const processLockPath = process.env.MANJI_LOCK_FILE || path.join(__dirname, ".manji-process.lock");
+let processLockOwned = false;
+function acquireProcessLock() {
+  require("node:fs").mkdirSync(path.dirname(processLockPath), { recursive: true });
+  const fs = require("node:fs");
+  const acquire = () => {
+    const fd = fs.openSync(processLockPath, "wx", 0o600);
+    fs.writeFileSync(fd, JSON.stringify({ pid: process.pid, startedAt: new Date().toISOString() }));
+    fs.closeSync(fd);
+    processLockOwned = true;
+  };
+  try { acquire(); return; }
+  catch (error) {
+    if (error.code !== "EEXIST") throw error;
+  }
+  let existing = null;
+  try { existing = JSON.parse(fs.readFileSync(processLockPath, "utf8")); } catch (_) {}
+  const pid = Number(existing && existing.pid);
+  let alive = false;
+  if (Number.isInteger(pid) && pid > 0) {
+    try { process.kill(pid, 0); alive = true; }
+    catch (error) { alive = error.code === "EPERM"; }
+  }
+  if (alive) throw new Error(`Another Manji process appears to be running (PID ${pid}, lock ${processLockPath}).`);
+  try { fs.unlinkSync(processLockPath); } catch (_) {}
+  acquire();
+}
+function releaseProcessLock() {
+  if (!processLockOwned) return;
+  const fs = require("node:fs");
+  try {
+    const current = JSON.parse(fs.readFileSync(processLockPath, "utf8"));
+    if (Number(current.pid) === process.pid) fs.unlinkSync(processLockPath);
+  } catch (_) {}
+  processLockOwned = false;
+}
+acquireProcessLock();
 
 // ============================================================
 // EXPRESS SERVER - Manji local-server control panel
@@ -1177,7 +1243,7 @@ function getReconnectDelay() {
     maxDelay,
   );
   const jitter = Math.floor(Math.random() * 2000);
-  return delay + jitter;
+  return Math.min(maxDelay, delay + jitter);
 }
 
 function createBot() {
@@ -1223,6 +1289,7 @@ function createBot() {
       respawn: true,
     });
 
+    bot.__manjiReconnectAllowed = true;
     bot.loadPlugin(pathfinder);
 
     bot.on("death", () => {
@@ -1290,11 +1357,12 @@ function createBot() {
       // steps; never dig, pillar, or parkour. Swimming remains available as a
       // recovery route, but dry paths are preferred by a moderate liquid cost.
       defaultMove.allow1by1towers = false;
-      defaultMove.allowParkour = false;
+      defaultMove.allowParkour = config.navigation?.allowParkour !== false;
       defaultMove.maxDropDown = 3;
       defaultMove.liquidCost = 5;
       defaultMove.allowSprinting = true;
 
+      initializeAutonomy(bot, defaultMove);
       initializeModules(bot, mcData, defaultMove);
 
       // Attempt creative mode (only works if bot has OP and enabled in settings)
@@ -1310,7 +1378,7 @@ function createBot() {
           message.includes("commands.gamemode.success.self") ||
           message.includes("Set own game mode to Creative Mode")
         ) {
-          addLog("[INFO] Bot is now in Creative Mode.");
+          addLog("[Server] Server reported that Manji is now in Creative Mode; V12.1 did not request this (try-creative is disabled by default).");
         }
       });
     });
@@ -1330,6 +1398,11 @@ function createBot() {
       });
       clearAllIntervals();
 
+      bot.__manjiReconnectAllowed = reconnectAfterKick(kickReason);
+      if (!bot.__manjiReconnectAllowed) {
+        botRunning = false;
+        addLog("[Bot] Kick looks permanent (protocol/version/auth/ban/whitelist). Automatic reconnect stopped; correct the setting and start Manji manually.");
+      }
       const reasonStr = String(kickReason).toLowerCase();
       if (
         reasonStr.includes("throttl") ||
@@ -1356,6 +1429,12 @@ function createBot() {
     bot.on("end", (reason) => {
       addLog(`[Bot] Disconnected: ${reason || "Unknown reason"}`);
       botState.connected = false;
+      try {
+        if (bot && bot.entity && bot.__manjiMemory) {
+          bot.__manjiMemory.setSession(bot.entity.position, bot.__manjiBrain?.current || 'disconnected');
+          void bot.__manjiMemory.save();
+        }
+      } catch (_) {}
       clearBotTimeouts();
       clearAllIntervals();
       spawnHandled = false; // reset for next connection
@@ -1373,7 +1452,8 @@ function createBot() {
 
       // Local-server mode: keep the service in desired-running state and retry
       // with exponential backoff until the user presses Stop in the dashboard.
-      if (botRunning && config.utils["auto-reconnect"] === true) {
+      const retryAllowed = !bot || bot.__manjiReconnectAllowed !== false;
+      if (botRunning && config.utils["auto-reconnect"] === true && retryAllowed && !isPermanentConnectionFailure(reason)) {
         scheduleReconnect();
       } else {
         botRunning = false;
@@ -1389,7 +1469,13 @@ function createBot() {
     });
   } catch (err) {
     addLog(`[Bot] Failed to create bot: ${err.message}`);
-    scheduleReconnect();
+    if (isRecoverableNetworkFailure(err)) {
+      scheduleReconnect();
+    } else {
+      botRunning = false;
+      isReconnecting = false;
+      addLog("[Bot] Non-transient startup failure; automatic retries stopped to avoid an endless loop. Check protocol/version/authentication and start Manji manually after correction.");
+    }
   }
 }
 
@@ -1422,6 +1508,213 @@ function scheduleReconnect() {
     isReconnecting = false;
     createBot();
   }, delay);
+}
+
+// ============================================================
+// AUTONOMOUS BRAIN, SENSORS AND MEMORY
+// ============================================================
+function startInvestigationBehavior(bot, defaultMove, brain) {
+  let targetId = null;
+  let investigationGoal = null;
+  let emergencyGoal = null;
+  let emergencyStartedAt = 0;
+  let startedAt = 0;
+  let retryAfter = 0;
+  const hostileNames = new Set([
+    'blaze', 'bogged', 'breeze', 'cave_spider', 'creeper', 'drowned', 'elder_guardian',
+    'ender_dragon', 'endermite', 'evoker', 'ghast', 'guardian', 'hoglin', 'husk',
+    'illusioner', 'magma_cube', 'phantom', 'piglin_brute', 'pillager', 'ravager',
+    'shulker', 'silverfish', 'skeleton', 'slime', 'spider', 'stray', 'vex',
+    'vindicator', 'warden', 'witch', 'wither', 'wither_skeleton', 'zoglin', 'zombie',
+    'zombie_villager', 'zombified_piglin'
+  ]);
+
+  function releaseOwnedGoal() {
+    if (investigationGoal && bot.pathfinder && bot.pathfinder.goal === investigationGoal) {
+      try { bot.pathfinder.setGoal(null); } catch (_) {}
+    }
+    targetId = null;
+    investigationGoal = null;
+    brain.setSignal('investigate', false);
+  }
+
+  function findDryEmergencyPoint() {
+    if (!bot.entity || typeof bot.blockAt !== 'function') return null;
+    const current = bot.entity.position;
+    const baseX = Math.floor(current.x);
+    const baseZ = Math.floor(current.z);
+    const candidates = [];
+    for (let radius = 2; radius <= 8; radius += 1) {
+      for (let dx = -radius; dx <= radius; dx += 1) {
+        for (let dz = -radius; dz <= radius; dz += 1) {
+          if (Math.max(Math.abs(dx), Math.abs(dz)) !== radius) continue;
+          for (const dy of [0, -1, 1, -2, 2]) {
+            const x = baseX + dx;
+            const y = Math.floor(current.y) + dy;
+            const z = baseZ + dz;
+            const feetPos = current.offset(x + 0.5 - current.x, y - current.y, z + 0.5 - current.z);
+            const floor = bot.blockAt(feetPos.offset(0, -1, 0));
+            const feet = bot.blockAt(feetPos);
+            const head = bot.blockAt(feetPos.offset(0, 1, 0));
+            const isWet = (block) => !!block && /water|lava/.test(String(block.name || '').toLowerCase());
+            if (floor && floor.boundingBox === 'block' && !isWet(floor) &&
+                feet && feet.boundingBox === 'empty' && !isWet(feet) &&
+                head && head.boundingBox === 'empty' && !isWet(head)) {
+              candidates.push({ x, y, z, score: Math.hypot(dx, dz) + Math.abs(dy) * 1.6 });
+            }
+          }
+        }
+      }
+      if (candidates.length) break;
+    }
+    candidates.sort((a, b) => a.score - b.score);
+    return candidates[0] || null;
+  }
+
+  addInterval(() => {
+    if (!botState.connected || !bot.entity || !bot.pathfinder || !bot.entities) return;
+    const now = Date.now();
+    const activity = brain.update();
+    if (activity === 'emergency') {
+      releaseOwnedGoal();
+      const position = bot.entity.position;
+      if (emergencyGoal && bot.pathfinder.goal !== emergencyGoal) emergencyGoal = null;
+      if (!emergencyGoal || now - emergencyStartedAt > 18_000) {
+        if (emergencyGoal && bot.pathfinder.goal === emergencyGoal) {
+          try { bot.pathfinder.setGoal(null); } catch (_) {}
+        }
+        const safePoint = findDryEmergencyPoint();
+        emergencyGoal = null;
+        if (safePoint) {
+          emergencyGoal = new goals.GoalNear(safePoint.x, safePoint.y, safePoint.z, 1);
+          try {
+            bot.pathfinder.setMovements(defaultMove);
+            bot.pathfinder.setGoal(emergencyGoal);
+            emergencyStartedAt = now;
+            addLog('[Survival] Lava detected; navigating toward the nearest dry, supported position.');
+          } catch (error) {
+            emergencyGoal = null;
+            addLog('[Survival] Could not set an emergency escape route:', error.message || String(error));
+          }
+        } else {
+          // Do not let the previous exploration path continue when an emergency
+          // destination cannot yet be found in the loaded chunks.
+          try { bot.pathfinder.setGoal(null); } catch (_) {}
+          for (const control of ['forward', 'back', 'left', 'right', 'sprint', 'jump']) {
+            try { bot.setControlState(control, false); } catch (_) {}
+          }
+          emergencyStartedAt = now;
+          addLog('[Survival] Lava detected but no dry standing point is currently loaded nearby; movement paused while sensors retry.');
+        }
+      }
+      if (emergencyGoal && position.distanceTo({ x: emergencyGoal.x + 0.5, y: emergencyGoal.y, z: emergencyGoal.z + 0.5 }) < 1.8) {
+        if (bot.pathfinder.goal === emergencyGoal) {
+          try { bot.pathfinder.setGoal(null); } catch (_) {}
+        }
+        emergencyGoal = null;
+      }
+      return;
+    }
+    if (emergencyGoal && bot.pathfinder.goal === emergencyGoal) {
+      try { bot.pathfinder.setGoal(null); } catch (_) {}
+      emergencyGoal = null;
+    }
+    if (activity === 'combat' || activity === 'recovery') {
+      releaseOwnedGoal();
+      return;
+    }
+    if (now < retryAfter) return;
+
+    const targetStillExists = targetId && bot.entities[targetId] && bot.entities[targetId].position;
+    if (targetStillExists) {
+      const target = bot.entities[targetId];
+      const distance = bot.entity.position.distanceTo(target.position);
+      if (distance <= 3.8) {
+        releaseOwnedGoal();
+        brain.setSignal('observe', true, { ttlMs: 2400, details: 'finished nearby investigation' });
+        retryAfter = now + 9000;
+        try { bot.lookAt(target.position.offset(0, Math.max(0.5, (target.height || 1) * 0.7), 0), true).catch(() => {}); } catch (_) {}
+        addLog(`[Brain] Finished investigating ${target.name || 'nearby entity'}.`);
+        return;
+      }
+      if (now - startedAt > 15000) {
+        const failedPosition = target.position;
+        releaseOwnedGoal();
+        if (manjiMemory) manjiMemory.markFailed(failedPosition, 'investigation-timeout', 30_000);
+        retryAfter = now + 12_000;
+        addLog('[Brain] Investigation timed out; this target will be ignored temporarily.');
+        return;
+      }
+      return;
+    }
+
+    if (targetId) releaseOwnedGoal();
+    const candidates = Object.values(bot.entities).filter((entity) => {
+      if (!entity || !entity.position || entity.id === bot.entity.id || entity.type === 'player') return false;
+      if (hostileNames.has(String(entity.name || '').toLowerCase())) return false;
+      const d = bot.entity.position.distanceTo(entity.position);
+      return entity.type === 'mob' && d >= 5 && d <= 13;
+    }).sort((a, b) => bot.entity.position.distanceTo(a.position) - bot.entity.position.distanceTo(b.position));
+
+    const target = candidates[0];
+    if (!target) return;
+    try {
+      const { GoalNear } = goals;
+      investigationGoal = new GoalNear(target.position.x, target.position.y, target.position.z, 3);
+      bot.pathfinder.setMovements(defaultMove);
+      bot.pathfinder.setGoal(investigationGoal);
+      targetId = target.id;
+      startedAt = now;
+      brain.setSignal('investigate', true, { details: { entity: target.name || 'unknown' } });
+      addLog(`[Brain] Investigating nearby ${target.name || 'entity'} at ${target.position.x.toFixed(1)}, ${target.position.y.toFixed(1)}, ${target.position.z.toFixed(1)}.`);
+    } catch (error) {
+      targetId = null;
+      investigationGoal = null;
+      retryAfter = now + 5000;
+      addLog('[Brain] Could not start investigation:', error.message || String(error));
+    }
+  }, 1200);
+}
+
+function initializeAutonomy(bot, defaultMove) {
+  const brain = new ActivityBrain();
+  const sensors = new SensorSuite(bot, manjiMemory);
+  bot.__manjiBrain = brain;
+  bot.__manjiSensors = sensors;
+  bot.__manjiMemory = manjiMemory;
+  brain.onChange(({ previous, current }) => {
+    addLog(`[Brain] Activity changed: ${previous} -> ${current}.`);
+  });
+  startInvestigationBehavior(bot, defaultMove, brain);
+  addInterval(() => {
+    if (!botState.connected || !bot.entity) return;
+    try {
+      const snapshot = sensors.scan();
+      if (!snapshot) return;
+      const emergency = snapshot.inLava;
+      brain.setSignal('emergency', emergency, { details: emergency ? 'critical health / lava' : null });
+      brain.update();
+      manjiMemory.setSession(bot.entity.position, brain.current);
+    } catch (error) {
+      addLog('[Sensors] Observation error:', error.message || String(error));
+    }
+  }, 1200);
+  addInterval(() => {
+    void manjiMemory.save().catch((error) => addLog('[Memory] Save failed:', error.message));
+  }, 30000);
+  let lastHungerWarningAt = 0;
+  addInterval(() => {
+    if (!botState.connected || !bot.entity) return;
+    const food = Number(bot.food);
+    const saturation = Number(bot.foodSaturation);
+    if (!Number.isFinite(food) || !Number.isFinite(saturation)) return;
+    if ((food < 18 || saturation < 2) && Date.now() - lastHungerWarningAt >= 30000) {
+      addLog(`[Survival] Server-reported hunger is low (food=${food}/20, saturation=${saturation.toFixed(1)}). Manji does not auto-hunt or craft food; configure server-side saturation for permanent supply.`);
+      lastHungerWarningAt = Date.now();
+    }
+  }, 5000);
+  addLog(`[Brain] Sensor suite active; persistent memory file: ${memoryFile}`);
+  addLog('[Brain] Autonomous activity arbitration is independent of human player count.');
 }
 
 // ============================================================
@@ -1574,7 +1867,6 @@ function startProceduralMovement(bot, defaultMove) {
   const pos = config.position || {};
   const configured = pos.enabled !== false &&
     Number.isFinite(Number(pos.x)) && Number.isFinite(Number(pos.z));
-  // The configured position is the spawn anchor, not a tiny walking pen.
   const centerX = configured ? Number(pos.x) : bot.entity.position.x;
   const centerY = configured && Number.isFinite(Number(pos.y)) ? Number(pos.y) : bot.entity.position.y;
   const centerZ = configured ? Number(pos.z) : bot.entity.position.z;
@@ -1582,15 +1874,62 @@ function startProceduralMovement(bot, defaultMove) {
   const returnRadius = explorationRadius * 0.82;
   const emergencyRadius = explorationRadius * 1.3;
 
+  const navConfig = (config.navigation && typeof config.navigation === 'object') ? config.navigation : {};
+  const replanCandidates = Math.max(2, Math.min(5, Number(navConfig.routeCandidates) || 4));
+  const stuckTimeoutMs = Math.max(2400, Number(navConfig.stuckTimeoutMs) || 3500);
+  const maxGoalTimeMs = Math.max(20000, Number(navConfig.maxGoalTimeMs) || 45000);
+  const memoryTtlMs = Math.max(30000, Number(navConfig.memoryTtlMs) || 7 * 24 * 60 * 60 * 1000);
+  const agentMemory = bot.__manjiMemory || manjiMemory;
+  const activityBrain = bot.__manjiBrain || null;
+  const routePlanner = new RoutePlanner({
+    pathfinder: bot.pathfinder,
+    movements: defaultMove,
+    memory: agentMemory,
+    candidates: replanCandidates,
+    totalTimeoutMs: Math.max(700, Number(navConfig.totalProbeBudgetMs) || 1500),
+    tickTimeoutMs: 4
+  });
+  const cornerRoutePlanner = new RoutePlanner({
+    pathfinder: bot.pathfinder,
+    movements: defaultMove,
+    memory: agentMemory,
+    candidates: 6,
+    totalTimeoutMs: 1100,
+    tickTimeoutMs: 4
+  });
+  let planning = false;
+  let localRecoveryInProgress = false;
+  let cornerRecoveryCycle = 0;
+  let consecutivePlanningFailures = 0;
+
+  // Soft movement preferences: no digging or 1x1 pillars. Parkour is allowed
+  // only through Pathfinder safe movement checks; the bot does not build towers.
+  defaultMove.canDig = false;
+  defaultMove.allow1by1towers = false;
+  defaultMove.allowParkour = navConfig.allowParkour !== false;
+  defaultMove.allowFreeMotion = false;
+  defaultMove.maxDropDown = 3;
+  defaultMove.liquidCost = 5;
+  defaultMove.allowSprinting = true;
+  if ('allowEntityDetection' in defaultMove) defaultMove.allowEntityDetection = true;
+  if ('entityCost' in defaultMove) defaultMove.entityCost = Math.max(Number(defaultMove.entityCost) || 0, 1.5);
+
   let currentGoal = null;
+  let activePathGoal = null;
+  let activeRoute = [];
+  let routeCursor = 0;
   let nextActionAt = Date.now() + 1200;
   let goalStartedAt = 0;
-  let lastProgressAt = Date.now();
-  let lastPosition = bot.entity.position.clone();
-  let lastGoalDistance = Infinity;
+  let lastRouteProgressAt = Date.now();
+  let lastSampleAt = 0;
+  let lastVisitedAt = 0;
   let heading = Math.random() * Math.PI * 2;
   let turnBias = Math.random() < 0.5 ? -1 : 1;
+  let routePreferenceY = bot.entity.position.y;
   const blockedWaypoints = new Map();
+  const failedCells = new Map();
+  const visitedCells = new Map();
+  const positionSamples = [];
 
   function distanceFromAnchor(position) {
     return Math.hypot(position.x - centerX, position.z - centerZ);
@@ -1600,23 +1939,55 @@ function startProceduralMovement(bot, defaultMove) {
     return !!block && /water|lava/.test(String(block.name || '').toLowerCase());
   }
 
-  function waypointKey(point) {
-    return `${point.x},${point.y},${point.z}`;
+  function cellKey(x, y, z) {
+    return `${Math.floor(x)},${Math.floor(y)},${Math.floor(z)}`;
   }
 
-  function rememberBlocked(point, reason) {
-    if (!point) return;
-    blockedWaypoints.set(waypointKey(point), Date.now() + 45000);
-    for (const [key, expiry] of blockedWaypoints) {
-      if (expiry <= Date.now()) blockedWaypoints.delete(key);
+  function pointKey(point) {
+    return cellKey(point.x, point.y, point.z);
+  }
+
+  function pruneMemory(now = Date.now()) {
+    for (const [key, expiry] of blockedWaypoints) if (expiry <= now) blockedWaypoints.delete(key);
+    for (const [key, expiry] of failedCells) if (expiry <= now) failedCells.delete(key);
+    for (const [key, seenAt] of visitedCells) if (now - seenAt > memoryTtlMs) visitedCells.delete(key);
+  }
+
+  function memoryStepCost(block) {
+    if (!block || !block.position) return 0;
+    const p = block.position;
+    const now = Date.now();
+    const failedUntil = failedCells.get(cellKey(p.x, p.y, p.z)) || 0;
+    const persistedFailed = agentMemory && agentMemory.isFailed(p, now);
+    let cost = failedUntil > now || persistedFailed ? 7 : 0;
+    const seenAt = visitedCells.get(cellKey(p.x, p.y, p.z));
+    const persistedVisitAge = agentMemory ? agentMemory.visitAge(p, now) : Infinity;
+    if ((seenAt && now - seenAt < memoryTtlMs) || Number.isFinite(persistedVisitAge)) {
+      // A modest cost nudges A* toward less-travelled corridors without making
+      // revisiting a necessary passage impossible.
+      const age = Math.min(seenAt ? now - seenAt : Infinity, persistedVisitAge);
+      cost += 1.15 * (1 - age / memoryTtlMs);
     }
-    addLog(`[Movement] Waypoint abandoned (${reason}); choosing another route.`);
+    // Avoid unnecessary climbs onto roofs/trees when both the current level
+    // and the requested destination are lower. This is a soft cost, not a ban.
+    const unnecessaryRise = p.y - routePreferenceY - 1;
+    if (unnecessaryRise > 0) cost += Math.min(8, unnecessaryRise * 1.6);
+    return cost;
   }
 
-  // Find a real, two-block-high standing space close to the intended location.
-  // A small local search is cheaper than scanning the entire 60-block area.
-  function findSafePointNear(idealX, idealZ, preferredY) {
-    if (!bot.entity || typeof bot.blockAt !== 'function') return null;
+  if (Array.isArray(defaultMove.exclusionAreasStep)) {
+    defaultMove.exclusionAreasStep.push(memoryStepCost);
+  }
+
+  function noteVisited(position, now = Date.now()) {
+    const key = cellKey(position.x, position.y, position.z);
+    visitedCells.set(key, now);
+    if (agentMemory) agentMemory.markVisited(position, now);
+    if (visitedCells.size > 700) pruneMemory(now);
+  }
+
+  function findSafePointsNear(idealX, idealZ, preferredY) {
+    if (!bot.entity || typeof bot.blockAt !== 'function') return [];
     const current = bot.entity.position;
     const baseX = Math.floor(idealX);
     const baseZ = Math.floor(idealZ);
@@ -1625,8 +1996,11 @@ function startProceduralMovement(bot, defaultMove) {
       [1, 1], [-1, 1], [1, -1], [-1, -1],
       [2, 0], [0, 2], [-2, 0], [0, -2]
     ];
+    // Prefer the current floor and small steps; larger height changes remain
+    // possible when the terrain provides no comparable lower alternative.
     const verticalOffsets = [0, -1, 1, -2, 2, -3, 3];
     const candidates = [];
+    const now = Date.now();
 
     for (const [ox, oz] of offsets) {
       const x = baseX + ox;
@@ -1637,128 +2011,312 @@ function startProceduralMovement(bot, defaultMove) {
         const floor = bot.blockAt(feetPos.offset(0, -1, 0));
         const feet = bot.blockAt(feetPos);
         const head = bot.blockAt(feetPos.offset(0, 1, 0));
-        if (
-          floor && floor.boundingBox === 'block' && !isLiquid(floor) &&
-          feet && feet.boundingBox === 'empty' && !isLiquid(feet) &&
-          head && head.boundingBox === 'empty' && !isLiquid(head)
-        ) {
-          const candidate = { x, y, z };
-          const blockedUntil = blockedWaypoints.get(waypointKey(candidate)) || 0;
-          if (blockedUntil > Date.now()) continue;
-          const score = Math.hypot((x + 0.5) - idealX, (z + 0.5) - idealZ) + Math.abs(y - preferredY) * 1.8;
-          candidates.push({ ...candidate, score });
-        }
+        if (!floor || floor.boundingBox !== 'block' || isLiquid(floor) ||
+            !feet || feet.boundingBox !== 'empty' || isLiquid(feet) ||
+            !head || head.boundingBox !== 'empty' || isLiquid(head)) continue;
+
+        const point = { x, y, z };
+        if ((blockedWaypoints.get(pointKey(point)) || 0) > now) continue;
+        const horizontal = Math.hypot((x + 0.5) - idealX, (z + 0.5) - idealZ);
+        const vertical = Math.abs(y - preferredY);
+        const visitedAt = visitedCells.get(pointKey(point)) || 0;
+        const revisitPenalty = visitedAt && now - visitedAt < memoryTtlMs
+          ? 2.0 * (1 - (now - visitedAt) / memoryTtlMs)
+          : 0;
+        const failedUntil = failedCells.get(pointKey(point)) || 0;
+        const failedPenalty = failedUntil > now ? 8 : 0;
+        point.localScore = horizontal + vertical * 3.2 + revisitPenalty + failedPenalty;
+        candidates.push(point);
       }
     }
-    candidates.sort((a, b) => a.score - b.score);
-    return candidates[0] || null;
+    candidates.sort((a, b) => a.localScore - b.localScore);
+    return candidates.slice(0, 3);
   }
 
-  function chooseWaypoint() {
-    if (!bot.entity) return null;
+  function generateWaypointCandidates(shortRange = false) {
+    if (!bot.entity) return [];
     const current = bot.entity.position;
     const radialDistance = distanceFromAnchor(current);
+    const candidates = [];
+    const seen = new Set();
 
-    // Beyond the soft boundary, head back toward a broad outer ring (about 82%
-    // of the radius), never all the way to spawn. Far outside, recover to it
-    // more decisively without changing the anchor.
     if (radialDistance > explorationRadius) {
       const radialAngle = Math.atan2(current.z - centerZ, current.x - centerX);
       const desiredRadius = radialDistance > emergencyRadius
-        ? explorationRadius * 0.9
-        : returnRadius + Math.random() * explorationRadius * 0.045;
-      const desiredAngle = radialAngle + (Math.random() - 0.5) * 0.35;
-      const idealX = centerX + Math.cos(desiredAngle) * desiredRadius;
-      const idealZ = centerZ + Math.sin(desiredAngle) * desiredRadius;
-      return findSafePointNear(idealX, idealZ, current.y);
-    }
-
-    // Correlated random walk: retain some heading from the previous leg, then
-    // add a bounded turn. Near the perimeter, follow a loose tangent or drift
-    // inward so Manji explores the area instead of orbiting a 5-block circle.
-    const nearBoundary = radialDistance > explorationRadius * 0.78;
-    const attempts = 22;
-    for (let attempt = 0; attempt < attempts; attempt++) {
-      let angle;
-      if (nearBoundary) {
-        const radialAngle = Math.atan2(current.z - centerZ, current.x - centerX);
-        if (Math.random() < 0.68) {
-          angle = radialAngle + turnBias * (Math.PI / 2 + (Math.random() - 0.5) * 0.9);
-        } else {
-          angle = radialAngle + Math.PI + (Math.random() - 0.5) * 0.9;
+        ? explorationRadius * 0.88
+        : returnRadius + Math.random() * explorationRadius * 0.04;
+      for (const angleOffset of [0, -0.38, 0.38, -0.8, 0.8]) {
+        const angle = radialAngle + angleOffset;
+        const idealX = centerX + Math.cos(angle) * desiredRadius;
+        const idealZ = centerZ + Math.sin(angle) * desiredRadius;
+        for (const point of findSafePointsNear(idealX, idealZ, current.y)) {
+          const key = pointKey(point);
+          if (seen.has(key)) continue;
+          seen.add(key);
+          point.localScore += Math.abs(distanceFromAnchor(point) - returnRadius) * 0.15;
+          candidates.push(point);
         }
-        // Occasionally reverse the preferred tangent direction to avoid a fixed orbit.
-        if (Math.random() < 0.16) turnBias *= -1;
-      } else {
-        heading += (Math.random() - 0.5) * 1.35;
-        angle = heading;
       }
-
-      const stepLength = 5 + Math.random() * 8;
-      const idealX = current.x + Math.cos(angle) * stepLength;
-      const idealZ = current.z + Math.sin(angle) * stepLength;
-      const safe = findSafePointNear(idealX, idealZ, current.y);
-      if (!safe) continue;
-      const resultingRadius = Math.hypot((safe.x + 0.5) - centerX, (safe.z + 0.5) - centerZ);
-      if (resultingRadius > explorationRadius * 1.035) continue;
-      if (Math.hypot((safe.x + 0.5) - current.x, (safe.z + 0.5) - current.z) < 3.2) continue;
-      heading = angle;
-      return safe;
+    } else {
+      const nearBoundary = radialDistance > explorationRadius * 0.78;
+      const attempts = shortRange ? 12 : 18;
+      for (let attempt = 0; attempt < attempts; attempt++) {
+        let angle;
+        if (nearBoundary) {
+          const radialAngle = Math.atan2(current.z - centerZ, current.x - centerX);
+          angle = Math.random() < 0.7
+            ? radialAngle + turnBias * (Math.PI / 2 + (Math.random() - 0.5) * 0.85)
+            : radialAngle + Math.PI + (Math.random() - 0.5) * 0.8;
+        } else {
+          angle = heading + (Math.random() - 0.5) * (shortRange ? 2.0 : 1.45);
+        }
+        const stepLength = shortRange ? 3.5 + Math.random() * 2.5 : 6 + Math.random() * 8;
+        const idealX = current.x + Math.cos(angle) * stepLength;
+        const idealZ = current.z + Math.sin(angle) * stepLength;
+        for (const point of findSafePointsNear(idealX, idealZ, current.y)) {
+          const key = pointKey(point);
+          if (seen.has(key)) continue;
+          seen.add(key);
+          const radial = distanceFromAnchor(point);
+          if (radial > explorationRadius * 1.035) continue;
+          const targetAngle = Math.atan2((point.z + 0.5) - current.z, (point.x + 0.5) - current.x);
+          let turnCost = Math.abs(Math.atan2(Math.sin(targetAngle - heading), Math.cos(targetAngle - heading)));
+          point.localScore += turnCost * 0.35;
+          point.localScore += Math.max(0, radial - explorationRadius * 0.86) * 0.22;
+          if (Math.hypot((point.x + 0.5) - current.x, (point.z + 0.5) - current.z) < (shortRange ? 2.2 : 3.2)) continue;
+          candidates.push(point);
+        }
+      }
+      if (Math.random() < 0.16) turnBias *= -1;
     }
 
-    // Last resort near the edge: choose a safe point on the outer ring.
-    const radialAngle = Math.atan2(current.z - centerZ, current.x - centerX);
-    const fallbackRadius = Math.min(returnRadius, Math.max(8, radialDistance - 5));
-    return findSafePointNear(
-      centerX + Math.cos(radialAngle) * fallbackRadius,
-      centerZ + Math.sin(radialAngle) * fallbackRadius,
-      current.y
-    );
+    candidates.sort((a, b) => a.localScore - b.localScore);
+    return candidates.slice(0, 12);
+  }
+
+  async function chooseReachableWaypoint() {
+    const primaryCandidates = generateWaypointCandidates(false);
+    const fallbackCandidates = generateWaypointCandidates(true);
+    if (!primaryCandidates.length && !fallbackCandidates.length) return null;
+    if (!bot.pathfinder || typeof bot.pathfinder.getPathFromTo !== 'function') {
+      addLog('[Navigation] This Pathfinder build lacks getPathFromTo; using the first safe local target without pre-check.');
+      return primaryCandidates[0] || fallbackCandidates[0] || null;
+    }
+    try {
+      return await planWaypointWithFallback({
+        routePlanner,
+        primaryCandidates,
+        fallbackCandidates,
+        currentPosition: bot.entity.position.clone()
+      });
+    } catch (error) {
+      addLog('[Navigation] Incremental route planning failed:', error.message || String(error));
+      return null;
+    }
   }
 
   function releaseMovementInputs() {
-    if (!bot || typeof bot.setControlState !== "function") return;
-    for (const control of ["forward", "back", "left", "right", "sprint", "jump"]) {
+    if (!bot || typeof bot.setControlState !== 'function') return;
+    for (const control of ['forward', 'back', 'left', 'right', 'sprint', 'jump']) {
       try { bot.setControlState(control, false); } catch (e) {}
+    }
+  }
+
+  function markFailedArea(point) {
+    if (!point) return;
+    const now = Date.now();
+    failedCells.set(pointKey(point), now + 30000);
+    if (agentMemory) agentMemory.markFailed(point, 'navigation-no-progress', 60_000, now);
+    if (activityBrain) activityBrain.setSignal('recovery', true, { ttlMs: 1800, details: 'navigation stuck' });
+    if (agentMemory) agentMemory.increment('recoveryAttempts');
+    for (const [key, expiry] of blockedWaypoints) if (expiry <= now) blockedWaypoints.delete(key);
+    for (const [key, expiry] of failedCells) if (expiry <= now) failedCells.delete(key);
+  }
+
+  async function tryLocalCornerRecovery(origin, reason) {
+    if (localRecoveryInProgress || planning || !origin || !botState.connected || !bot.entity || !bot.pathfinder) return false;
+    const activity = activityBrain ? activityBrain.update() : 'explore';
+    if (!canInterruptForCornerRecovery(activity) ||
+        (bot.__manjiCombatUntil && bot.__manjiCombatUntil > Date.now())) return false;
+    localRecoveryInProgress = true;
+    planning = true;
+    const startedAt = Date.now();
+    try {
+      const raw = buildCornerEscapeCandidates(origin, cornerRecoveryCycle++);
+      const candidates = [];
+      const liquid = (block) => !!block && /water|lava/.test(String(block.name || '').toLowerCase());
+      for (const point of raw) {
+        const feetPos = origin.offset(point.x + 0.5 - origin.x, point.y - origin.y, point.z + 0.5 - origin.z);
+        const floor = bot.blockAt(feetPos.offset(0, -1, 0));
+        const feet = bot.blockAt(feetPos);
+        const head = bot.blockAt(feetPos.offset(0, 1, 0));
+        if (!floor || floor.boundingBox !== 'block' || liquid(floor) ||
+            !feet || feet.boundingBox !== 'empty' || liquid(feet) ||
+            !head || head.boundingBox !== 'empty' || liquid(head)) continue;
+        if ((blockedWaypoints.get(pointKey(point)) || 0) > Date.now()) continue;
+        candidates.push(point);
+      }
+      const target = await cornerRoutePlanner.choose(candidates, origin.clone());
+      if (!target || !botState.connected || !bot.entity || !bot.pathfinder ||
+          !canInterruptForCornerRecovery(activityBrain ? activityBrain.update() : 'explore') ||
+          (bot.__manjiCombatUntil && bot.__manjiCombatUntil > Date.now())) return false;
+
+      const now = Date.now();
+      bot.pathfinder.setMovements(defaultMove);
+      activePathGoal = new GoalNear(target.x, target.y, target.z, 0.8);
+      bot.pathfinder.setGoal(activePathGoal);
+      currentGoal = { ...target, recoveryDetour: true };
+      goalStartedAt = now;
+      lastRouteProgressAt = now;
+      activeRoute = [];
+      routeCursor = 0;
+      positionSamples.length = 0;
+      nextActionAt = now + 1000;
+      addLog(`[Navigation] Local corner recovery (${reason}); A* selected escape waypoint (${target.x}, ${target.y}, ${target.z}) after ${Date.now() - startedAt}ms.`);
+      return true;
+    } catch (error) {
+      addLog(`[Navigation] Local corner recovery failed: ${error.message || String(error)}.`);
+      return false;
+    } finally {
+      planning = false;
+      localRecoveryInProgress = false;
     }
   }
 
   function abandonCurrentGoal(reason) {
     if (!currentGoal) return;
-    rememberBlocked(currentGoal, reason);
-    // setGoal(null) is Pathfinder's immediate stop; clearing the movement keys
-    // also prevents residual forward input from making foot particles at a wall.
+    const now = Date.now();
+    blockedWaypoints.set(pointKey(currentGoal), now + 60000);
+    const currentPos = bot.entity ? bot.entity.position : null;
+    if (currentPos) {
+      // Penalize the exact cell where progress stopped, not the whole corridor.
+      markFailedArea({ x: currentPos.x, y: currentPos.y, z: currentPos.z });
+    }
+    if (agentMemory) agentMemory.increment('routesAbandoned');
+    addLog(`[Navigation] Route abandoned (${reason}); remembered the failed location and will probe alternatives.`);
     try { bot.pathfinder.setGoal(null); } catch (e) {}
     releaseMovementInputs();
     currentGoal = null;
-    nextActionAt = Date.now() + 800 + Math.floor(Math.random() * 800);
-    lastProgressAt = Date.now();
-    lastGoalDistance = Infinity;
-    lastPosition = bot.entity ? bot.entity.position.clone() : lastPosition;
+    activePathGoal = null;
+    activeRoute = [];
+    routeCursor = 0;
+    nextActionAt = now + 1800;
+    lastRouteProgressAt = now;
+    positionSamples.length = 0;
+    if (currentPos) void tryLocalCornerRecovery(currentPos, reason).then((recovered) => {
+      if (!recovered && botState.connected && !currentGoal) nextActionAt = Date.now() + 500;
+    });
   }
 
-  // Pathfinder exposes these events for no-path and stuck cases. They let us
-  // discard the blocked waypoint instead of repeatedly walking into the same block.
+  function routeNodeDistance(position, node) {
+    return Math.hypot(position.x - (node.x + 0.5), position.y - node.y, position.z - (node.z + 0.5));
+  }
+
+  function updateRouteProgress(position, now) {
+    if (!activeRoute.length) return false;
+    const start = Math.max(0, routeCursor);
+    const end = Math.min(activeRoute.length - 1, start + 7);
+    let nearestIndex = -1;
+    let nearestDistance = Infinity;
+    for (let i = start; i <= end; i++) {
+      const d = routeNodeDistance(position, activeRoute[i]);
+      if (d < nearestDistance) { nearestDistance = d; nearestIndex = i; }
+    }
+    if (nearestIndex >= 0 && nearestDistance <= 1.35 && nearestIndex > routeCursor) {
+      routeCursor = nearestIndex;
+      lastRouteProgressAt = now;
+      return true;
+    }
+    // If we are close to the currently expected node, advance across nodes
+    // already covered by the bot's hitbox to avoid false stall detections.
+    while (routeCursor < activeRoute.length - 1 &&
+           routeNodeDistance(position, activeRoute[routeCursor]) <= 1.0) {
+      routeCursor++;
+      lastRouteProgressAt = now;
+    }
+    return false;
+  }
+
+  function isOscillating(position, now) {
+    if (now - lastSampleAt < 700) return false;
+    lastSampleAt = now;
+    positionSamples.push({ position: position.clone(), at: now });
+    while (positionSamples.length && now - positionSamples[0].at > 3600) positionSamples.shift();
+    if (positionSamples.length < 4) return false;
+
+    const first = positionSamples[0].position;
+    const net = position.distanceTo(first);
+    let travel = 0;
+    for (let i = 1; i < positionSamples.length; i++) {
+      travel += positionSamples[i].position.distanceTo(positionSamples[i - 1].position);
+    }
+    // High cumulative motion with almost no net displacement is a back-and-
+    // forth loop. Low cumulative motion is a hard collision/stationary stall.
+    return (travel > 1.0 && net < 0.42) || (travel < 0.4 && now - goalStartedAt > 3200);
+  }
+
+  function clearCurrentGoal(reached = false) {
+    if (reached && agentMemory) agentMemory.increment('routesReached');
+    try { bot.pathfinder.setGoal(null); } catch (e) {}
+    currentGoal = null;
+    activePathGoal = null;
+    activeRoute = [];
+    routeCursor = 0;
+    positionSamples.length = 0;
+    lastRouteProgressAt = Date.now();
+    nextActionAt = Date.now() + (reached ? 1600 + Math.floor(Math.random() * 3500) : 900);
+  }
+
   bot.on('path_update', (result) => {
     if (!currentGoal || (bot.__manjiCombatUntil && bot.__manjiCombatUntil > Date.now())) return;
-    if (result && (result.status === 'noPath' || result.status === 'timeout')) {
-      abandonCurrentGoal(result.status);
+    if (!result) return;
+    if (Array.isArray(result.path) && result.path.length) {
+      activeRoute = result.path.map((node) => ({ x: node.x, y: node.y, z: node.z }));
+      routeCursor = 0;
     }
-  });
-  bot.on('path_reset', (reason) => {
-    if (reason === 'stuck' && currentGoal && !(bot.__manjiCombatUntil && bot.__manjiCombatUntil > Date.now())) {
-      abandonCurrentGoal('pathfinder stuck');
+    if (result.status === 'noPath' && (!result.path || result.path.length === 0)) {
+      abandonCurrentGoal('pathfinder reported noPath');
     }
   });
 
-  addLog(`[Movement] Natural exploration enabled. Spawn anchor=(${centerX.toFixed(2)}, ${centerY.toFixed(2)}, ${centerZ.toFixed(2)}), soft radius=${explorationRadius}, return ring≈${returnRadius.toFixed(0)}.`);
+  bot.on('path_reset', (reason) => {
+    if (reason === 'stuck' && currentGoal && !(bot.__manjiCombatUntil && bot.__manjiCombatUntil > Date.now())) {
+      abandonCurrentGoal('pathfinder stuck event');
+    }
+  });
+
+  bot.on('goal_reached', (goal) => {
+    if (activePathGoal && goal === activePathGoal && currentGoal) clearCurrentGoal(true);
+  });
+
+  addLog(`[Navigation] Adaptive explorer enabled: A* pre-checks, route memory, stuck recovery, cautious parkour=${defaultMove.allowParkour}, no digging/towers; anchor=(${centerX.toFixed(2)}, ${centerY.toFixed(2)}, ${centerZ.toFixed(2)}), radius=${explorationRadius}.`);
 
   addInterval(() => {
     if (!bot || !botState.connected || !bot.entity || !bot.pathfinder) return;
-    if (bot.__manjiCombatUntil && bot.__manjiCombatUntil > Date.now()) return;
+    if ((activityBrain && activityBrain.isHigherPriorityThanExploration()) ||
+        (bot.__manjiCombatUntil && bot.__manjiCombatUntil > Date.now())) {
+      routePlanner.cancel();
+      return;
+    }
 
     const now = Date.now();
     const position = bot.entity.position;
+    pruneMemory(now);
+    if (now - lastVisitedAt >= 1000) {
+      noteVisited(position, now);
+      lastVisitedAt = now;
+    }
+
+    // Combat may temporarily replace our exploration goal. Drop the stale
+    // pointer after combat so the explorer does not supervise the combat path.
+    if (currentGoal && activePathGoal && bot.pathfinder.goal !== activePathGoal) {
+      currentGoal = null;
+      activePathGoal = null;
+      activeRoute = [];
+      routeCursor = 0;
+      positionSamples.length = 0;
+      nextActionAt = now + 900;
+    }
 
     if (currentGoal) {
       const goalDistance = Math.hypot(
@@ -1766,68 +2324,81 @@ function startProceduralMovement(bot, defaultMove) {
         position.y - currentGoal.y,
         position.z - (currentGoal.z + 0.5)
       );
-      if (goalDistance <= 1.6) {
-        try { bot.pathfinder.setGoal(null); } catch (e) {}
-        currentGoal = null;
-        nextActionAt = now + 1600 + Math.floor(Math.random() * 4300);
-        lastGoalDistance = Infinity;
-        if (Math.random() < 0.42) {
-          const yaw = Math.random() * Math.PI * 2 - Math.PI;
-          const pitch = (Math.random() - 0.5) * 0.28;
-          bot.look(yaw, pitch, false).catch(() => {});
-        }
+      if (goalDistance <= 1.65) {
+        clearCurrentGoal(true);
         return;
       }
 
-      // Measure real displacement. A route may briefly curve sideways around a
-      // wall, so movement need not reduce straight-line distance to the waypoint;
-      // but if the position stays almost fixed, cancel before it keeps pushing.
-      const physicalDisplacement = position.distanceTo(lastPosition);
-      if (physicalDisplacement >= 0.14) {
-        lastPosition = position.clone();
-        lastProgressAt = now;
-      }
-      if (now - lastProgressAt > 4200 || now - goalStartedAt > 45000) {
-        abandonCurrentGoal('no physical movement / blocked route');
+      updateRouteProgress(position, now);
+      const oscillating = isOscillating(position, now);
+      const routeStalled = activeRoute.length > 0 && now - lastRouteProgressAt > stuckTimeoutMs;
+      const noRouteStall = activeRoute.length === 0 && now - goalStartedAt > 3200 && oscillating;
+      const routeDeadline = Math.min(maxGoalTimeMs, 17000 + Math.max(0, activeRoute.length) * 950);
+      if (routeStalled || noRouteStall || now - goalStartedAt > routeDeadline) {
+        abandonCurrentGoal(routeStalled ? 'route nodes stopped advancing' :
+          noRouteStall ? 'oscillation / no route progress' : 'waypoint time limit');
       }
       return;
     }
 
     if (now < nextActionAt) return;
 
-    // Natural pauses: look around, then select a new locally reachable leg.
-    if (Math.random() < 0.2) {
+    // Small idle pauses and head movement make the controller less mechanical.
+    if (Math.random() < 0.16) {
       const yaw = Math.random() * Math.PI * 2 - Math.PI;
-      const pitch = (Math.random() - 0.5) * 0.38;
+      const pitch = (Math.random() - 0.5) * 0.32;
       bot.look(yaw, pitch, false).catch(() => {});
-      nextActionAt = now + 1800 + Math.floor(Math.random() * 4200);
+      nextActionAt = now + 1200 + Math.floor(Math.random() * 2600);
       return;
     }
 
-    const target = chooseWaypoint();
-    if (!target) {
-      nextActionAt = now + 1800;
-      addLog('[Movement] No safe nearby waypoint found; will try another direction.');
-      return;
-    }
-
-    try {
+    if (planning) return;
+    planning = true;
+    void chooseReachableWaypoint().then((target) => {
+      if (!botState.connected || !bot.entity || !bot.pathfinder) return;
+      if ((activityBrain && activityBrain.isHigherPriorityThanExploration()) ||
+          (bot.__manjiCombatUntil && bot.__manjiCombatUntil > Date.now())) return;
+      const planningNow = Date.now();
+      if (!target) {
+        consecutivePlanningFailures = Math.min(4, consecutivePlanningFailures + 1);
+        const retryDelay = Math.min(8000, 1000 * (2 ** (consecutivePlanningFailures - 1)));
+        // Change heading after a failed batch so the next candidates explore a
+        // genuinely different sector instead of probing the same corridor.
+        heading += (Math.random() < 0.5 ? -1 : 1) * (0.9 + Math.random() * 0.9);
+        turnBias *= -1;
+        nextActionAt = planningNow + retryDelay;
+        addLog(`[Navigation] No reachable route after primary and local-detour probes; rotating search direction and retrying in ${(retryDelay / 1000).toFixed(1)}s.`);
+        return;
+      }
+      consecutivePlanningFailures = 0;
+      try {
+      const currentPosition = bot.entity.position;
+      routePreferenceY = Math.max(currentPosition.y, target.y);
       bot.pathfinder.setMovements(defaultMove);
-      bot.pathfinder.setGoal(new GoalNear(target.x, target.y, target.z, 1));
+      activePathGoal = new GoalNear(target.x, target.y, target.z, 1);
+      bot.pathfinder.setGoal(activePathGoal);
       currentGoal = target;
-      goalStartedAt = now;
-      lastProgressAt = now;
-      lastGoalDistance = Math.hypot(position.x - (target.x + 0.5), position.z - (target.z + 0.5));
-      lastPosition = position.clone();
-      botState.lastActivity = now;
-      addLog(`[Movement] Exploring toward waypoint (${target.x}, ${target.y}, ${target.z}); distance from spawn=${distanceFromAnchor(position).toFixed(1)}.`);
-    } catch (e) {
-      currentGoal = null;
-      nextActionAt = now + 1800;
-      addLog('[Movement] Could not set waypoint:', e.message);
-    }
-  }, 650);
+      if (agentMemory) agentMemory.increment('routesStarted');
+      goalStartedAt = planningNow;
+      lastRouteProgressAt = planningNow;
+      activeRoute = [];
+      routeCursor = 0;
+      positionSamples.length = 0;
+      heading = Math.atan2((target.z + 0.5) - currentPosition.z, (target.x + 0.5) - currentPosition.x);
+      botState.lastActivity = planningNow;
+      addLog(`[Navigation] Selected ${target.recoveryDetour ? 'local recovery detour' : 'reachable waypoint'} (${target.x}, ${target.y}, ${target.z}) via ${target.previewStatus || 'pathfinder'} route (${target.previewLength || '?'} nodes); spawn distance=${distanceFromAnchor(currentPosition).toFixed(1)}.`);
+      } catch (e) {
+        currentGoal = null;
+        activePathGoal = null;
+        nextActionAt = Date.now() + 1200;
+        addLog('[Navigation] Could not set route goal:', e.message || String(e));
+      }
+    }).catch((error) => {
+      addLog('[Navigation] Route planner task rejected:', error.message || String(error));
+    }).finally(() => { planning = false; });
+  }, 500);
 }
+
 function startRandomJump(bot) {
   addInterval(() => {
     if (
@@ -1853,7 +2424,8 @@ function startRandomJump(bot) {
 function startLookAround(bot) {
   addInterval(() => {
     if (!bot || !botState.connected) return;
-    if (bot.__manjiCombatUntil > Date.now()) return;
+    if ((bot.__manjiCombatUntil && bot.__manjiCombatUntil > Date.now()) ||
+        (bot.__manjiBrain && bot.__manjiBrain.isHigherPriorityThanExploration())) return;
     try {
       const yaw = Math.random() * Math.PI * 2 - Math.PI;
       const pitch = (Math.random() * Math.PI) / 2 - Math.PI / 4;
@@ -1910,6 +2482,8 @@ function avoidMobs(bot) {
 // FIX: autoEat - use i.foodPoints directly (mineflayer item property) instead of broken mcData lookup
 function combatModule(bot, mcData) {
   let lastAttackTime = 0;
+  let eating = false;
+  let lastEatAttemptAt = 0;
   let lockedTarget = null;
   let lockedTargetExpiry = 0;
 
@@ -1959,22 +2533,20 @@ function combatModule(bot, mcData) {
   });
 
   // FIX: autoEat - check foodPoints property on the item directly (works reliably)
-  bot.on("health", () => {
-    if (!config.combat["auto-eat"]) return;
+  bot.on("health", async () => {
+    if (!config.combat["auto-eat"] || eating || !botState.connected) return;
+    if (Date.now() - lastEatAttemptAt < 2500 || Number(bot.food) >= 14) return;
+    const food = bot.inventory.items().find((item) => Number(item.foodPoints) > 0);
+    if (!food) return;
+    eating = true;
+    lastEatAttemptAt = Date.now();
     try {
-      if (bot.food < 14) {
-        const food = bot.inventory
-          .items()
-          .find((i) => i.foodPoints && i.foodPoints > 0);
-        if (food) {
-          bot
-            .equip(food, "hand")
-            .then(() => bot.consume())
-            .catch((e) => addLog("[AutoEat] Error:", e.message));
-        }
-      }
+      await bot.equip(food, "hand");
+      if (Number(bot.food) < 20 && botState.connected) await bot.consume();
     } catch (e) {
       addLog("[AutoEat] Error:", e.message);
+    } finally {
+      eating = false;
     }
   });
 }
@@ -2026,8 +2598,52 @@ function damageReactionModule(bot, defaultMove) {
   const root = config.interactions || {};
   const settings = root["damage-reactions"] || {};
   const combat = root["self-defence"] || {};
+  const navigationConfig = config.navigation || {};
+  const combatStuckTimeoutMs = Math.max(900, Number(navigationConfig.combatStuckTimeoutMs) || 1450);
   const reactionsEnabled = settings.enabled !== false;
   const combatEnabled = combat.enabled === true;
+
+  // Armor maintenance is independent of hostile scanning. It is serialized
+  // only against simultaneous weapon equip/stow transactions.
+  let controllerBusy = false;
+  let currentMode = null;
+  let weaponController = null;
+  const armorSettings = (config.equipment && config.equipment.armor) || {};
+  if (armorSettings.enabled !== false) {
+    const armorController = new ArmorController(bot, {
+      log: addLog,
+      customSlotKeywords: armorSettings["custom-slot-keywords"] || {},
+      operationTimeoutMs: armorSettings["operation-timeout-ms"] || 2500,
+      upgradeMargin: armorSettings["upgrade-margin"] ?? 0.25,
+      // Armor is safe to maintain during movement/combat. Only serialize with
+      // another hand-slot transaction; pausing for the whole combat tick could
+      // starve armor checks because hostile scanning runs continuously.
+      canRun: () => canRunArmorTransaction(bot, weaponController)
+    });
+    const armorIntervalMs = Math.max(2500, Number(armorSettings["check-interval-ms"]) || 3000);
+    let armorRefreshTimer = null;
+    const refreshArmorSoon = () => {
+      if (armorRefreshTimer) clearTimeout(armorRefreshTimer);
+      armorRefreshTimer = setTimeout(() => {
+        armorRefreshTimer = null;
+        if (bot && botState.connected) void armorController.equipBestAvailable();
+      }, 300);
+    };
+    if (bot.inventory && typeof bot.inventory.on === 'function') {
+      // Picking up armor or having a slot updated triggers a quick re-check.
+      if (armorSettings['rescan-on-inventory-change'] !== false) {
+        bot.inventory.on('updateSlot', refreshArmorSoon);
+        if (typeof bot.on === 'function') bot.on('windowUpdate', refreshArmorSoon);
+      }
+    }
+    setTimeout(() => {
+      if (bot && botState.connected) void armorController.equipBestAvailable();
+    }, 1800);
+    addInterval(() => {
+      if (bot && botState.connected) void armorController.equipBestAvailable();
+    }, armorIntervalMs);
+  }
+
   if (!reactionsEnabled && !combatEnabled) return;
 
   const baseCooldown = Math.max(1000, Number(settings["base-cooldown-ms"]) || 5000);
@@ -2038,24 +2654,43 @@ function damageReactionModule(bot, defaultMove) {
   const combatRadius = Math.max(detectionRadius, Number(combat["combat-radius"]) || 16);
   const safeDistance = Math.max(8, Number(combat["safe-distance"]) || 14);
   const fleeDistance = Math.max(8, Number(combat["flee-distance"]) || 16);
+  const targetLostGraceMs = Math.max(1000, Number(combat["target-lost-grace-ms"]) || 6500);
 
   let lastReactionAt = 0;
   let lastDamageAt = 0;
   let previousMessage = null;
-  let controllerBusy = false;
   let currentTargetId = null;
-  let currentMode = null;
+  let lastTargetConfirmedAt = 0;
   let lastGoalRefresh = 0;
   let lastAttackAt = 0;
-  let weaponEquipping = false;
-  let weaponStowing = false;
-  let combatWeaponEquippedByUs = false;
-  let combatWeaponName = null;
+  weaponController = new WeaponController(bot, { log: addLog, retryMs: 5000, operationTimeoutMs: 1800 });
+  // Put an already-selected sword/axe/tool away on startup and keep a small
+  // idle supervisor active even when the combat scan exits early. It never
+  // interrupts the brief validated melee attack window.
+  void weaponController.stowAfterThreat();
+  addInterval(() => {
+    if (!botState.connected || !bot.entity || !weaponController || weaponController.isAttackWindowActive()) return;
+    void weaponController.stowAfterThreat();
+  }, 1200);
+  let combatRecoveryCycle = 0;
+  let combatRecovery = { targetId: null, lastPosition: null, lastTargetPosition: null, lastProgressAt: 0, lastReplanAt: 0, attempts: 0, requested: false, replanning: false, detour: null };
+  let projectileDodgeUntil = 0;
+  let lastProjectileDodgeAt = 0;
+  let lastNoDodgeSpotLogAt = 0;
   let creeperPhase = null;
   let lastNoWeaponLog = 0;
   let lastCreeperWarningAt = 0;
   let fleePlan = null;
   let fleeRouteIndex = 0;
+  const combatDetourPlanner = new RoutePlanner({
+    pathfinder: bot.pathfinder,
+    movements: defaultMove,
+    memory: bot.__manjiMemory || manjiMemory,
+    candidates: 6,
+    totalTimeoutMs: 520,
+    tickTimeoutMs: 3,
+    goalFactory: (x, y, z, range) => new GoalNear(x, y, z, range)
+  });
 
   const hostileMobs = new Set([
     "blaze", "bogged", "breeze", "cave_spider", "creeper", "drowned",
@@ -2194,90 +2829,196 @@ function damageReactionModule(bot, defaultMove) {
     return message;
   }
 
-  function isCombatWeaponName(name) {
-    const n = String(name || "").toLowerCase();
-    return /_(sword|axe)$/.test(n) || n === "trident" || n === "mace";
-  }
-
-  function findWeapon() {
-    const items = bot.inventory && bot.inventory.items ? bot.inventory.items() : [];
-    // Rank known melee weapons by their normal base hit damage. Enchantments
-    // and special fall damage are not inferred from inventory metadata.
-    const damage = {
-      netherite_axe: 10, diamond_axe: 9, iron_axe: 9, stone_axe: 9,
-      golden_axe: 7, wooden_axe: 7,
-      trident: 9,
-      netherite_sword: 8, diamond_sword: 7, iron_sword: 6,
-      stone_sword: 5, golden_sword: 4, wooden_sword: 4,
-      mace: 6
-    };
-    return items
-      .filter((item) => isCombatWeaponName(item.name))
-      .sort((a, b) => (damage[String(b.name).toLowerCase()] || 0) - (damage[String(a.name).toLowerCase()] || 0))[0] || null;
-  }
-
   async function equipBestWeapon() {
-    if (weaponEquipping || weaponStowing) return false;
-    const weapon = findWeapon();
-    if (!weapon) return false;
-    const held = bot.heldItem;
-    if (held && held.name === weapon.name) {
-      combatWeaponName = held.name;
-      combatWeaponEquippedByUs = true;
-      return true;
-    }
-    weaponEquipping = true;
-    try {
-      await bot.equip(weapon, "hand");
-      const equipped = !!(bot.heldItem && bot.heldItem.name === weapon.name);
-      if (equipped) {
-        combatWeaponName = bot.heldItem.name;
-        combatWeaponEquippedByUs = true;
-        addLog(`[Combat] Equipped strongest available weapon: ${bot.heldItem.name}.`);
-      }
-      return equipped;
-    } catch (e) {
-      addLog("[Combat] Could not equip weapon:", e.message);
-      return false;
-    } finally {
-      weaponEquipping = false;
-    }
+    return weaponController.equipForCombat();
   }
 
   async function stowCombatWeapon() {
-    if (weaponStowing || weaponEquipping) return false;
-    const held = bot.heldItem;
-    // When no attack is in progress, any melee weapon in the hand is put away,
-    // including one that was already selected before this module took over.
-    // Other items (food, blocks, tools) are left untouched.
-    if (!held || !isCombatWeaponName(held.name)) {
-      combatWeaponEquippedByUs = false;
-      combatWeaponName = null;
-      return false;
-    }
-    if (typeof bot.unequip !== "function") return false;
-    weaponStowing = true;
-    try {
-      await bot.unequip("hand");
-      combatWeaponEquippedByUs = false;
-      combatWeaponName = null;
-      addLog("[Combat] Weapon stowed; no attack in progress.");
-      return true;
-    } catch (e) {
-      addLog("[Combat] Could not stow weapon:", e.message);
-      return false;
-    } finally {
-      weaponStowing = false;
-    }
+    return weaponController.stowAfterThreat();
   }
 
   function hasWeapon() {
-    const held = bot.heldItem;
-    if (held && isCombatWeaponName(held.name)) return true;
-    return !!findWeapon();
+    return weaponController.hasWeapon();
   }
 
+  function resetCombatRecovery(target) {
+    combatRecovery = {
+      targetId: target ? target.id : null,
+      lastPosition: bot.entity && bot.entity.position ? bot.entity.position.clone() : null,
+      lastTargetPosition: target && target.position ? target.position.clone() : null,
+      lastProgressAt: Date.now(),
+      lastReplanAt: 0,
+      attempts: 0,
+      requested: false,
+      replanning: false,
+      detour: null
+    };
+  }
+
+  function findSafeCombatDetourCandidates(target) {
+    if (!bot.entity || typeof bot.blockAt !== 'function') return [];
+    const current = bot.entity.position;
+    const raw = buildCombatDetourCandidates(current, target.position, combatRecoveryCycle++);
+    const safe = [];
+    const isLiquidBlock = (block) => !!block && /water|lava/.test(String(block.name || '').toLowerCase());
+    for (const point of raw) {
+      const feetPos = current.offset(point.x + 0.5 - current.x, point.y - current.y, point.z + 0.5 - current.z);
+      const floor = bot.blockAt(feetPos.offset(0, -1, 0));
+      const feet = bot.blockAt(feetPos);
+      const head = bot.blockAt(feetPos.offset(0, 1, 0));
+      if (!floor || floor.boundingBox !== 'block' || isLiquidBlock(floor) ||
+          !feet || feet.boundingBox !== 'empty' || isLiquidBlock(feet) ||
+          !head || head.boundingBox !== 'empty' || isLiquidBlock(head)) continue;
+      safe.push(point);
+      if (safe.length >= 18) break;
+    }
+    return safe;
+  }
+
+  async function replanCombatApproach(target, reason) {
+    if (!target || !target.position || !bot.entity || !bot.pathfinder || combatRecovery.replanning) return false;
+    const now = Date.now();
+    if (now - combatRecovery.lastReplanAt < 1100) return false;
+    combatRecovery.replanning = true;
+    combatRecovery.lastReplanAt = now;
+    try {
+      // First escape the exact corner/block face where the bot is stuck.
+      // Candidate points are checked for two-block body clearance and previewed
+      // through the same incremental A* engine before a short hop is selected.
+      const localCandidates = findSafeCombatDetourCandidates(target);
+      const localTarget = await combatDetourPlanner.choose(localCandidates, bot.entity.position.clone());
+      if (!botState.connected || !bot.entity || !bot.pathfinder || currentTargetId !== target.id) return false;
+
+      if (localTarget) {
+        bot.pathfinder.setGoal(null);
+        releaseMovementControls();
+        bot.pathfinder.setMovements(defaultMove);
+        const detourGoal = new GoalNear(localTarget.x, localTarget.y, localTarget.z, 0.8);
+        bot.pathfinder.setGoal(detourGoal);
+        combatRecovery.detour = {
+          x: localTarget.x, y: localTarget.y, z: localTarget.z,
+          startedAt: now, lastProgressAt: now,
+          lastPosition: bot.entity.position.clone(),
+          expiresAt: now + 4200
+        };
+        combatRecovery.lastPosition = bot.entity.position.clone();
+        combatRecovery.lastTargetPosition = target.position.clone();
+        combatRecovery.lastProgressAt = now;
+        combatRecovery.attempts += 1;
+        combatRecovery.requested = false;
+        lastGoalRefresh = now;
+        addLog(`[Navigation] Corner recovery (${reason}); selected a reachable local detour at (${localTarget.x}, ${localTarget.y}, ${localTarget.z}) before resuming pursuit (attempt ${combatRecovery.attempts}).`);
+        return true;
+      }
+
+      // If no local escape point can be previewed, retain the earlier flank
+      // strategy as a bounded fallback; never dig or build a pillar.
+      const candidates = buildApproachCandidates(bot.entity.position, target.position, combatRecoveryCycle++);
+      const goalsToTry = candidates.map((point) => new GoalNear(point.x, point.y, point.z, 1));
+      goalsToTry.push(new GoalFollow(target, 2.2));
+      bot.pathfinder.setGoal(null);
+      releaseMovementControls();
+      bot.pathfinder.setMovements(defaultMove);
+      bot.pathfinder.setGoal(new GoalCompositeAny(goalsToTry), true);
+      combatRecovery.lastPosition = bot.entity.position.clone();
+      combatRecovery.lastTargetPosition = target.position.clone();
+      combatRecovery.lastProgressAt = now;
+      combatRecovery.attempts += 1;
+      combatRecovery.requested = false;
+      lastGoalRefresh = now;
+      addLog(`[Navigation] No reachable local detour found (${reason}); trying ${candidates.length} wider flank positions around the target.`);
+      return true;
+    } catch (error) {
+      combatRecovery.requested = false;
+      addLog(`[Navigation] Combat route recovery failed: ${error.message || String(error)}.`);
+      return false;
+    } finally {
+      combatRecovery.replanning = false;
+    }
+  }
+
+  function superviseCombatApproach(target, targetDistance) {
+    if (!target || !target.position || !bot.entity || !bot.pathfinder) return;
+    if (currentMode === 'projectile-dodge' && Date.now() < projectileDodgeUntil) return;
+    const now = Date.now();
+    if (combatRecovery.targetId !== target.id || !combatRecovery.lastPosition) resetCombatRecovery(target);
+    if (combatRecovery.replanning) return;
+
+    const position = bot.entity.position;
+    if (combatRecovery.detour) {
+      const detour = combatRecovery.detour;
+      const distanceToDetour = Math.hypot(position.x - (detour.x + 0.5), position.y - detour.y, position.z - (detour.z + 0.5));
+      const movedDuringDetour = position.distanceTo(detour.lastPosition);
+      if (movedDuringDetour >= 0.22) {
+        detour.lastPosition = position.clone();
+        detour.lastProgressAt = now;
+      }
+      if (distanceToDetour <= 1.2) {
+        combatRecovery.detour = null;
+        combatRecovery.lastPosition = position.clone();
+        combatRecovery.lastProgressAt = now;
+        combatRecovery.lastTargetPosition = target.position.clone();
+        combatRecovery.requested = false;
+        try {
+          bot.pathfinder.setMovements(defaultMove);
+          bot.pathfinder.setGoal(new GoalFollow(target, 2.2), true);
+          addLog('[Navigation] Local detour reached; resuming direct hostile pursuit.');
+        } catch (error) {
+          combatRecovery.requested = true;
+          addLog(`[Navigation] Could not resume pursuit after detour: ${error.message || String(error)}.`);
+        }
+        return;
+      }
+      if (combatRecovery.requested || now - detour.lastProgressAt >= combatStuckTimeoutMs || now >= detour.expiresAt) {
+        combatRecovery.detour = null;
+        combatRecovery.requested = true;
+        try { bot.pathfinder.setGoal(null); } catch (_) {}
+        releaseMovementControls();
+      } else {
+        return;
+      }
+    }
+
+    if (targetDistance <= 3.4) {
+      combatRecovery.lastPosition = position.clone();
+      combatRecovery.lastProgressAt = now;
+      combatRecovery.requested = false;
+      return;
+    }
+
+    const moved = position.distanceTo(combatRecovery.lastPosition);
+    const targetMoved = combatRecovery.lastTargetPosition
+      ? target.position.distanceTo(combatRecovery.lastTargetPosition)
+      : Infinity;
+    if (moved >= 0.28) {
+      combatRecovery.lastPosition = position.clone();
+      combatRecovery.lastProgressAt = now;
+      combatRecovery.attempts = 0;
+    }
+
+    if (combatRecovery.lastReplanAt && targetMoved >= 1.25 && now - combatRecovery.lastReplanAt >= 1100) {
+      combatRecovery.requested = true;
+    }
+    const stalled = now - combatRecovery.lastProgressAt >= combatStuckTimeoutMs;
+    if ((stalled || combatRecovery.requested) && now - combatRecovery.lastReplanAt >= 1100) {
+      void replanCombatApproach(target, stalled ? `no position progress for ${Math.round(combatStuckTimeoutMs)}ms` : 'target moved away from detour/flank');
+    }
+  }
+
+  bot.on('path_reset', (reason) => {
+    if (reason === 'stuck' && (currentMode === 'attack' || currentMode === 'creeper-approach')) {
+      combatRecovery.requested = true;
+    }
+  });
+  bot.on('path_update', (result) => {
+    if (result && (result.status === 'noPath' || result.status === 'timeout') &&
+        (currentMode === 'attack' || currentMode === 'creeper-approach')) {
+      combatRecovery.requested = true;
+    }
+  });
+
   function stopCombat(reason) {
+    if (bot.__manjiBrain) bot.__manjiBrain.setSignal('combat', false);
     if (currentMode === null && currentTargetId === null) {
       void stowCombatWeapon();
       return;
@@ -2285,7 +3026,9 @@ function damageReactionModule(bot, defaultMove) {
     try { if (bot.pathfinder) bot.pathfinder.setGoal(null); } catch (e) {}
     addLog(`[Combat] Combat behaviour ended: ${reason}.`);
     currentTargetId = null;
+    lastTargetConfirmedAt = 0;
     currentMode = null;
+    resetCombatRecovery(null);
     creeperPhase = null;
     fleePlan = null;
     lastGoalRefresh = 0;
@@ -2331,6 +3074,46 @@ function damageReactionModule(bot, defaultMove) {
     if (typeof bot.setControlState !== "function") return;
     for (const control of ["forward", "back", "left", "right", "sprint", "jump"]) {
       try { bot.setControlState(control, false); } catch (e) {}
+    }
+  }
+
+  function tryDodgeIncomingProjectile() {
+    if (!bot.entity || !bot.pathfinder || !bot.entities) return false;
+    const now = Date.now();
+    if (now < projectileDodgeUntil) return true;
+    if (now - lastProjectileDodgeAt < 850) return false;
+
+    const threat = findIncomingProjectile(Object.values(bot.entities), bot.entity.position, {
+      maxDistance: 12, maxTicks: 12, hitRadius: 1.45
+    });
+    if (!threat) return false;
+
+    const points = buildLateralDodgePoints(bot.entity.position, threat.velocity, 3.4);
+    const safeSpots = points
+      .map((point) => findEscapeStandingSpot(point.x, point.z, bot.entity.position.y))
+      .filter(Boolean);
+    if (!safeSpots.length) {
+      if (now - lastNoDodgeSpotLogAt >= 3000) {
+        addLog(`[Combat][Defense] Incoming ${threat.name} predicted, but no safe lateral standing spot is available.`);
+        lastNoDodgeSpotLogAt = now;
+      }
+      return false;
+    }
+
+    try {
+      const dodgeGoals = safeSpots.map((spot) => new GoalNear(spot.x, spot.y, spot.z, 1));
+      bot.pathfinder.setGoal(null);
+      releaseMovementControls();
+      bot.pathfinder.setMovements(defaultMove);
+      bot.pathfinder.setGoal(new GoalCompositeAny(dodgeGoals));
+      currentMode = 'projectile-dodge';
+      projectileDodgeUntil = now + 950;
+      lastProjectileDodgeAt = now;
+      addLog(`[Combat][Defense] Incoming ${threat.name} predicted in ${threat.timeToClosest.toFixed(1)} ticks; executing lateral dodge.`);
+      return true;
+    } catch (error) {
+      addLog(`[Combat][Defense] Could not set projectile evasion route: ${error.message || String(error)}.`);
+      return false;
     }
   }
 
@@ -2477,17 +3260,32 @@ function damageReactionModule(bot, defaultMove) {
     try {
       const nearby = getHostiles(detectionRadius);
       const active = currentTargetId && bot.entities ? bot.entities[currentTargetId] : null;
-      let target = nearby.find((entity) => entity.name === "creeper") || nearby[0] || null;
-
-      // Continue the existing target briefly even if it has moved just beyond
-      // the scan radius, so a fight/retreat is not cancelled between scans.
-      if (!target && active && active.position && distanceTo(active) <= combatRadius && canSeeHostile(active)) target = active;
+      const now = Date.now();
+      const target = selectCombatTarget({
+        visibleTargets: nearby,
+        activeTarget: active,
+        currentTargetId,
+        lastConfirmedAt: lastTargetConfirmedAt,
+        now,
+        combatRadius,
+        lostGraceMs: targetLostGraceMs,
+        distanceTo
+      });
       if (!target) {
+        if (tryDodgeIncomingProjectile()) {
+          if (bot.__manjiBrain) bot.__manjiBrain.setSignal('combat', true, { details: { target: 'projectile-defense' } });
+          return;
+        }
         stopCombat("no hostile mobs nearby");
         return;
       }
+      if (tryDodgeIncomingProjectile()) {
+        if (bot.__manjiBrain) bot.__manjiBrain.setSignal('combat', true, { details: { target: target.name } });
+        return;
+      }
+      if (bot.__manjiBrain) bot.__manjiBrain.setSignal('combat', true, { details: { target: target.name } });
+      if (canSeeHostile(target)) lastTargetConfirmedAt = now;
 
-      const now = Date.now();
       const mobKey = String(target.name || "").toLowerCase();
       const isCreeper = mobKey === "creeper";
       const targetDistance = distanceTo(target);
@@ -2496,13 +3294,16 @@ function damageReactionModule(bot, defaultMove) {
       const previousMode = currentMode;
 
       if (targetChanged) {
+        resetCombatRecovery(target);
         currentTargetId = target.id;
+        lastTargetConfirmedAt = now;
         lastGoalRefresh = 0;
         fleePlan = null;
         creeperPhase = isCreeper ? (weaponAvailable ? "approach" : "retreat") : null;
       }
 
       bot.__manjiCombatUntil = Date.now() + 1800;
+      superviseCombatApproach(target, targetDistance);
 
       if (isCreeper && targetChanged && Date.now() - lastCreeperWarningAt > 6000) {
         try { bot.chat("¡Ayuda! ¡Un creeper me está persiguiendo!"); } catch (e) {}
@@ -2575,8 +3376,8 @@ function damageReactionModule(bot, defaultMove) {
 
         let attacked = false;
         try {
-          const aim = target.position.offset(0, Math.max(0.5, (target.height || 1.5) * 0.55), 0);
-          await bot.lookAt(aim, true);
+          const aim = target.position.offset(0, Math.max(0.65, (target.height || 1.5) * 0.78), 0);
+          await withTimeout(bot.lookAt(aim, true), 900, 'aim at hostile');
           if (bot.entities && bot.entities[target.id] && distanceTo(target) <= 3.15 &&
               canSeeHostile(target)) {
             bot.attack(target);
@@ -2598,8 +3399,10 @@ function damageReactionModule(bot, defaultMove) {
         return;
       }
 
-      // Other hostile mobs: equip the strongest weapon while pursuing and
-      // fighting, but put it away as soon as no hostile target remains.
+      // Other hostile mobs: draw the weapon once when combat starts and keep
+      // it equipped for the whole engagement. The previous version drew and
+      // stowed it around every single hit, making Manji look idle between
+      // swings and repeatedly interrupting its combat state.
       if (!weaponAvailable) {
         currentMode = "flee";
         await stowCombatWeapon();
@@ -2631,25 +3434,29 @@ function damageReactionModule(bot, defaultMove) {
         }
       }
 
-      const equipped = await equipBestWeapon();
-      if (!equipped) return;
-      if (
-        targetDistance <= 3.35 &&
+      // Keep the sword in hand while Manji is pursuing or fighting a hostile.
+      // equipForCombat refreshes the controller's active-combat lease so the
+      // idle hand supervisor cannot put the sword away between attack ticks.
+      const weaponReady = await equipBestWeapon();
+      if (!weaponReady) return;
+
+      const attackWindow = targetDistance <= 3.35 &&
         Date.now() - lastAttackAt >= 650 &&
-        bot.entities && bot.entities[target.id]
-      ) {
-        try {
-          const aim = target.position.offset(0, Math.max(0.5, (target.height || 1.5) * 0.55), 0);
-          await bot.lookAt(aim, true);
-          if (canSeeHostile(target)) {
-            if (bot.entities[target.id] && distanceTo(target) <= 3.6) {
-              bot.attack(target);
-              lastAttackAt = Date.now();
-            }
-          }
-        } catch (e) {
-          addLog("[Combat] Attack attempt failed:", e.message);
+        bot.entities && bot.entities[target.id];
+      if (!attackWindow) return;
+
+      try {
+        const aim = target.position.offset(0, Math.max(0.65, (target.height || 1.5) * 0.78), 0);
+        await withTimeout(bot.lookAt(aim, true), 900, 'aim at hostile');
+        // Visibility is required for the actual hit, but not for retaining the
+        // combat lock while Pathfinder works around a wall/corner.
+        if (bot.entities[target.id] && distanceTo(target) <= 3.6 && canSeeHostile(target)) {
+          bot.attack(target);
+          lastAttackAt = Date.now();
+          addLog(`[Combat] Attack command sent to ${mobNames[mobKey] || mobKey}; weapon remains equipped while combat continues.`);
         }
+      } catch (e) {
+        addLog("[Combat] Attack attempt failed:", e.message);
       }
     } catch (e) {
       addLog("[Combat] Controller error:", e.message);
@@ -2657,6 +3464,13 @@ function damageReactionModule(bot, defaultMove) {
       controllerBusy = false;
     }
   }
+
+
+  bot.on('entityDead', (entity) => {
+    if (entity && currentTargetId != null && entity.id === currentTargetId) {
+      addLog(`[Combat] Target eliminated: ${mobNames[String(entity.name || '').toLowerCase()] || entity.name || 'hostile mob'}.`);
+    }
+  });
 
   if (combatEnabled) {
     // Scan continuously, not only after receiving damage. This is the key fix
@@ -2822,83 +3636,83 @@ function sendDiscordWebhook(content, color = 0x0099ff) {
 }
 
 // ============================================================
-// CRASH RECOVERY - IMMORTAL MODE
-// FIX: guard against uncaughtException stacking reconnects when isReconnecting is already true
+// PROCESS FAILURE POLICY
+// Ordinary Minecraft disconnects are retried by the bot's "end" handler.
+// An uncaught exception is different: continuing after it can leave Node.js
+// state inconsistent. Persist what we can, clean up, and let the host's
+// process supervisor restart the service according to its configured policy.
 // ============================================================
-process.on("uncaughtException", (err) => {
-  const msg = err.message || "Unknown";
-  addLog(`[FATAL] Uncaught Exception: ${msg}`);
-  botState.errors.push({ type: "uncaught", message: msg, time: Date.now() });
+let fatalShutdownStarted = false;
 
-  // Cap errors array to prevent memory leak over long uptimes
-  if (botState.errors.length > 100) {
-    botState.errors = botState.errors.slice(-50);
-  }
+function fatalProcessShutdown(source, error) {
+  if (fatalShutdownStarted) return;
+  fatalShutdownStarted = true;
+  shutdownStarted = true;
+  const message = error && (error.stack || error.message)
+    ? (error.stack || error.message)
+    : String(error);
+  addLog(`[FATAL] ${source}: ${message}`);
+  botState.errors.push({ type: source, message: String(message).slice(0, 2000), time: Date.now() });
+  if (botState.errors.length > 100) botState.errors = botState.errors.slice(-50);
 
-  const isNetworkError =
-    msg.includes("PartialReadError") ||
-    msg.includes("ECONNRESET") ||
-    msg.includes("EPIPE") ||
-    msg.includes("ETIMEDOUT") ||
-    msg.includes("timed out") ||
-    msg.includes("write after end") ||
-    msg.includes("This socket has been ended");
-
-  if (isNetworkError) {
-    addLog("[FATAL] Known network/protocol error - recovering gracefully...");
-  }
-
-  // Recover only when automatic reconnection is explicitly enabled
+  botRunning = false;
+  isReconnecting = false;
+  clearBotTimeouts();
   clearAllIntervals();
-  botState.connected = false;
 
-  // Reset reconnect state before applying the configured reconnect policy
-  if (isReconnecting) {
-    addLog(
-      "[FATAL] isReconnecting was stuck - resetting before crash recovery",
-    );
-    isReconnecting = false;
-    // BUG FIX: was referencing non-existent 'reconnectTimeout' — correct name is 'reconnectTimeoutId'
-    if (reconnectTimeoutId) {
-      clearTimeout(reconnectTimeoutId);
-      reconnectTimeoutId = null;
-    }
+  const activeBot = bot;
+  bot = null;
+  if (activeBot) {
+    try { activeBot.removeAllListeners(); } catch (_) {}
+    try { activeBot.end(); } catch (_) {}
   }
 
-  setTimeout(
-    () => {
-      scheduleReconnect();
-    },
-    isNetworkError ? 5000 : 10000,
-  );
+  // Do not wait indefinitely for sockets or a disk write after a fatal error.
+  const forceExit = setTimeout(() => {
+    releaseProcessLock();
+    process.exit(1);
+  }, 5000);
+
+  void manjiMemory.save()
+    .catch((saveError) => addLog('[Memory] Save during fatal shutdown failed:', saveError.message || String(saveError)))
+    .finally(() => {
+      clearTimeout(forceExit);
+      releaseProcessLock();
+      try {
+        if (typeof server.closeAllConnections === 'function') server.closeAllConnections();
+        server.close(() => process.exit(1));
+      } catch (_) {
+        process.exit(1);
+      }
+    });
+}
+
+process.on('uncaughtException', (error) => {
+  fatalProcessShutdown('uncaughtException', error);
 });
 
-process.on("unhandledRejection", (reason) => {
-  const msg = String(reason);
-  addLog(`[FATAL] Unhandled Rejection: ${reason}`);
-  botState.errors.push({ type: "rejection", message: msg, time: Date.now() });
-  if (botState.errors.length > 100) {
-    botState.errors = botState.errors.slice(-50);
-  }
+process.on('unhandledRejection', (reason) => {
+  const message = reason && (reason.stack || reason.message)
+    ? (reason.stack || reason.message)
+    : String(reason);
+  const isNetworkError = isRecoverableNetworkFailure(reason);
 
-  const isNetworkError =
-    msg.includes("ETIMEDOUT") ||
-    msg.includes("ECONNRESET") ||
-    msg.includes("EPIPE") ||
-    msg.includes("ENOTFOUND") ||
-    msg.includes("timed out") ||
-    msg.includes("PartialReadError");
+  addLog(`[${isNetworkError ? 'WARN' : 'FATAL'}] Unhandled promise rejection: ${message}`);
+  botState.errors.push({ type: 'rejection', message: String(message).slice(0, 2000), time: Date.now() });
+  if (botState.errors.length > 100) botState.errors = botState.errors.slice(-50);
 
-  if (isNetworkError && !isReconnecting) {
-    addLog("[FATAL] Network rejection — triggering reconnect...");
-    clearAllIntervals();
-    botState.connected = false;
-    if (bot) {
+  if (isNetworkError) {
+    // The network stack may reject while Mineflayer is closing; let the normal
+    // connection lifecycle own recovery and keep the backoff/de-duplication.
+    if (bot && botRunning && config.utils['auto-reconnect'] === true) {
       try { bot.end(); } catch (_) {}
-      bot = null;
+    } else if (botRunning && config.utils['auto-reconnect'] === true) {
+      scheduleReconnect();
     }
-    scheduleReconnect();
+    return;
   }
+
+  fatalProcessShutdown('unhandledRejection', reason);
 });
 
 let shutdownStarted = false;
@@ -2912,12 +3726,24 @@ function gracefulShutdown(signal) {
   const activeBot = bot;
   bot = null;
   if (activeBot) {
+    try {
+      if (activeBot.entity) manjiMemory.setSession(activeBot.entity.position, activeBot.__manjiBrain?.current || 'shutdown');
+    } catch (_) {}
     try { activeBot.quit(`Process ${signal}`); } catch (e) {
       try { activeBot.end(); } catch (_) {}
     }
   }
-  server.close(() => process.exit(0));
-  setTimeout(() => process.exit(0), 5000).unref();
+  const shutdownDeadline = setTimeout(() => {
+    addLog('[Memory] Shutdown save deadline reached; exiting with last completed save.');
+    releaseProcessLock();
+    process.exit(0);
+  }, 5000);
+  shutdownDeadline.unref();
+  void manjiMemory.save().catch((error) => addLog('[Memory] Final save failed:', error.message)).finally(() => {
+    clearTimeout(shutdownDeadline);
+    releaseProcessLock();
+    server.close(() => process.exit(0));
+  });
 }
 
 process.on("SIGTERM", () => gracefulShutdown("SIGTERM"));
@@ -2928,7 +3754,7 @@ process.on("SIGINT", () => gracefulShutdown("SIGINT"));
 // START THE BOT
 // ============================================================
 addLog("=".repeat(50));
-addLog("  Manji Local v10 - Persistent Home Server Edition");
+addLog("  Manji v12 - Autonomous AI 24/7");
 addLog("=".repeat(50));
 addLog(`Server: ${config.server.ip}:${config.server.port}`);
 if (!process.env.MC_HOST && ["127.0.0.1", "localhost", "::1"].includes(String(config.server.ip).toLowerCase())) {

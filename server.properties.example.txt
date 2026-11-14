@@ -1,7 +1,7 @@
-# Minecraft Java 26.3 home server settings
-# A connected Manji bot prevents the server from being empty.
+# Ejemplo para un servidor Minecraft Java autogestionado.
+# No modifica la configuración de un proveedor externo.
+# Un valor positivo pausa el servidor cuando no hay jugadores conectados.
+# 0 desactiva esa pausa vanilla.
+pause-when-empty-seconds=0
+# Evita expulsar por inactividad a jugadores conectados.
 player-idle-timeout=0
-pause-when-empty-seconds=60
-# Keep server-ip empty unless you have a deliberate advanced bind configuration.
-server-ip=
-server-port=25565

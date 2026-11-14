@@ -1,4 +1,6 @@
 node_modules/
-npm-debug.log*
 .env
 *.log
+data/*.json
+data/*.tmp-*
+data/*.corrupt-*

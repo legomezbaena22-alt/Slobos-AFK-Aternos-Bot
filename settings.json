@@ -1,5 +1,5 @@
 {
-  "name": "Manji v10.1 - Aternos default (host editable)",
+  "name": "Manji v12.2.1 - Integration Fix",
   "bot-account": {
     "username": "Manji",
     "password": "",
@@ -20,7 +20,7 @@
   },
   "utils": {
     "auto-auth": {
-      "enabled": true,
+      "enabled": false,
       "password": ""
     },
     "anti-afk": {
@@ -28,7 +28,7 @@
       "sneak": false
     },
     "chat-messages": {
-      "enabled": false,
+      "enabled": true,
       "repeat": true,
       "repeat-delay": 300,
       "messages": [
@@ -69,7 +69,7 @@
   },
   "combat": {
     "attack-mobs": false,
-    "auto-eat": true
+    "auto-eat": false
   },
   "beds": {
     "pick-up-day": false,
@@ -122,8 +122,42 @@
       "max-combat-ms": 30000,
       "player-retaliation-hits": 2,
       "flee-distance": 16,
+      "target-lost-grace-ms": 6500,
       "detection-radius": 12,
       "safe-distance": 14
+    }
+  },
+  "navigation": {
+    "routeCandidates": 4,
+    "totalProbeBudgetMs": 1500,
+    "stuckTimeoutMs": 3500,
+    "maxGoalTimeMs": 45000,
+    "memoryTtlMs": 604800000,
+    "failedCellTtlMs": 60000,
+    "allowParkour": true,
+    "combatStuckTimeoutMs": 1450
+  },
+  "survival": {
+    "auto-eat": false,
+    "saturation": {
+      "source": "server-side",
+      "required": true,
+      "warning-interval-ms": 30000
+    }
+  },
+  "equipment": {
+    "armor": {
+      "enabled": true,
+      "check-interval-ms": 3000,
+      "operation-timeout-ms": 2500,
+      "upgrade-margin": 0.25,
+      "custom-slot-keywords": {
+        "head": [],
+        "torso": [],
+        "legs": [],
+        "feet": []
+      },
+      "rescan-on-inventory-change": true
     }
   }
 }
